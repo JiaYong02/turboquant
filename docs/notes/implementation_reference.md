@@ -361,9 +361,8 @@ class TurboQuantProd:
 
         r = x - x_tilde_mse                           # residual
         gamma = np.linalg.norm(r, axis=-1)             # scalar or (n,)
-        # Normalize residual for QJL (QJL assumes unit norm input)
-        r_normalized = r / np.maximum(gamma[..., np.newaxis] if r.ndim > 1 else gamma, 1e-10)
-        qjl_signs = self.qjl.quantize(r_normalized)
+        # sign() is scale-invariant, so we pass raw r (not normalized)
+        qjl_signs = self.qjl.quantize(r)
 
         return {
             'mse': mse_q,

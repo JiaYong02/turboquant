@@ -1,9 +1,17 @@
 {
+  "env": {
+    "CLAUDE_CODE_GIT_BASH_PATH": "C:\\Program Files\\Git\\bin\\bash.exe"
+  },
   "permissions": {
     "allow": [
       "Bash(pip install:*)",
       "Bash(python -c ':*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(mkdir -p C:/Users/Dell/Documents/jerry/turboquant/src/turboquant)",
+      "Bash(mkdir -p C:/Users/Dell/Documents/jerry/turboquant/tests)",
+      "mcp__plugin_ecc_github__create_issue",
+      "Bash(gh auth:*)",
+      "Bash(echo \"EXIT: $?\")"
     ]
   }
 }
