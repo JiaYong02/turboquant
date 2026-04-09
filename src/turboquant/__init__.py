@@ -15,3 +15,20 @@ __all__ = [
     "TurboQuantMSE",
     "TurboQuantProd",
 ]
+
+try:
+    from .codebook_torch import LloydMaxCodebookTorch
+    from .qjl_torch import QJLTorch
+    from .quantizer_mse_torch import TurboQuantMSETorch
+    from .quantizer_prod_torch import TurboQuantProdTorch
+    from .rotation_torch import RandomRotationTorch
+
+    __all__ += [
+        "LloydMaxCodebookTorch",
+        "QJLTorch",
+        "RandomRotationTorch",
+        "TurboQuantMSETorch",
+        "TurboQuantProdTorch",
+    ]
+except ImportError:
+    pass
