@@ -32,3 +32,10 @@ try:
     ]
 except ImportError:
     pass
+
+try:
+    from .integrations.hf_cache import TurboQuantCache
+
+    __all__ += ["TurboQuantCache"]
+except ImportError:
+    pass

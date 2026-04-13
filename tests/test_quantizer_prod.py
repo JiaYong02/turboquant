@@ -130,6 +130,36 @@ class TestInnerProductDistortion:
         )
 
 
+class TestQuantizeWithNorm:
+    """Test quantize_with_norm / dequantize_with_norm for non-unit vectors."""
+
+    def test_single_vector(self):
+        q = TurboQuantProd(d=128, b=2, seed=0)
+        rng = np.random.RandomState(42)
+        x = rng.randn(128) * 3.0
+        quantized, norm = q.quantize_with_norm(x)
+        x_hat = q.dequantize_with_norm(quantized, norm)
+        assert x_hat.shape == (128,)
+        np.testing.assert_allclose(norm, np.linalg.norm(x), rtol=1e-5)
+
+    def test_batch(self):
+        q = TurboQuantProd(d=128, b=2, seed=0)
+        rng = np.random.RandomState(42)
+        x = rng.randn(20, 128) * 5.0
+        quantized, norms = q.quantize_with_norm(x)
+        x_hat = q.dequantize_with_norm(quantized, norms)
+        assert x_hat.shape == (20, 128)
+        assert norms.shape == (20,)
+
+    def test_zero_vector(self):
+        q = TurboQuantProd(d=128, b=2, seed=0)
+        x = np.zeros(128)
+        quantized, norm = q.quantize_with_norm(x)
+        x_hat = q.dequantize_with_norm(quantized, norm)
+        assert norm == 0.0
+        assert x_hat.shape == (128,)
+
+
 class TestDifferentDimensions:
     """Works across various dimensions."""
 

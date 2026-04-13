@@ -72,3 +72,41 @@ class TurboQuantProd:
 
         x_qjl = self.qjl.dequantize(quantized["qjl"], quantized["gamma"])
         return x_mse + x_qjl
+
+    def quantize_with_norm(
+        self, x: np.ndarray
+    ) -> tuple[dict, np.ndarray]:
+        """Quantize non-unit vector(s) by normalizing first.
+
+        Args:
+            x: Input of shape (d,) or (n, d).
+
+        Returns:
+            Tuple of (quantized dict, norms).
+        """
+        if x.ndim == 1:
+            norm = np.linalg.norm(x)
+            x_unit = x / norm if norm > 0 else x
+            return self.quantize(x_unit), norm
+        else:
+            norms = np.linalg.norm(x, axis=1, keepdims=True)
+            x_unit = np.where(norms > 0, x / norms, x)
+            return self.quantize(x_unit), norms.squeeze(1)
+
+    def dequantize_with_norm(
+        self, quantized: dict, norms: np.ndarray | float
+    ) -> np.ndarray:
+        """Dequantize and rescale by stored norms.
+
+        Args:
+            quantized: Dict from quantize_with_norm().
+            norms: Scalar or array of shape (n,).
+
+        Returns:
+            Reconstructed vector(s) at original scale.
+        """
+        x_unit = self.dequantize(quantized)
+        if x_unit.ndim == 1:
+            return x_unit * norms
+        else:
+            return x_unit * np.asarray(norms)[:, np.newaxis]

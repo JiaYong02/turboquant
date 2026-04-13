@@ -95,6 +95,42 @@ class TestDifferentDimensions:
         assert x_hat.shape == x.shape
 
 
+class TestQuantizeWithNorm:
+    def test_single_vector(self):
+        q = TurboQuantProdTorch(d=128, b=2, seed=0)
+        x = torch.randn(128) * 3.0
+        quantized, norm = q.quantize_with_norm(x)
+        x_hat = q.dequantize_with_norm(quantized, norm)
+        assert x_hat.shape == (128,)
+        assert norm.item() == pytest.approx(torch.linalg.norm(x).item(), rel=1e-5)
+
+    def test_batch(self):
+        q = TurboQuantProdTorch(d=128, b=2, seed=0)
+        x = torch.randn(20, 128) * 5.0
+        quantized, norms = q.quantize_with_norm(x)
+        x_hat = q.dequantize_with_norm(quantized, norms)
+        assert x_hat.shape == (20, 128)
+        assert norms.shape == (20,)
+
+    def test_zero_vector(self):
+        q = TurboQuantProdTorch(d=128, b=2, seed=0)
+        x = torch.zeros(128)
+        quantized, norm = q.quantize_with_norm(x)
+        x_hat = q.dequantize_with_norm(quantized, norm)
+        assert norm.item() == 0.0
+        assert x_hat.shape == (128,)
+
+    def test_norm_preserved(self):
+        q = TurboQuantProdTorch(d=128, b=4, seed=42)
+        x = torch.randn(50, 128) * 2.0
+        quantized, norms = q.quantize_with_norm(x)
+        x_hat = q.dequantize_with_norm(quantized, norms)
+        # Reconstructed norms should be close to original
+        hat_norms = torch.linalg.norm(x_hat, dim=1)
+        ratio = hat_norms / norms
+        assert (ratio.mean() - 1.0).abs() < 0.3
+
+
 class TestDevice:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA")
     def test_cuda_round_trip(self):

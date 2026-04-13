@@ -62,3 +62,53 @@ class RandomRotationTorch:
             Original-space tensor, same shape as input.
         """
         return y @ self.Pi
+
+
+class BatchedRandomRotationTorch:
+    """Stacked rotation matrices for H attention heads.
+
+    Holds H independent d×d orthogonal rotation matrices as a single
+    [H, d, d] tensor to enable batched GPU matmuls via torch.bmm.
+
+    Args:
+        d: Dimension of each rotation matrix.
+        num_heads: Number of heads (H).
+        seeds: Sequence of H integer seeds, one per head.
+        device: Target device.
+    """
+
+    def __init__(
+        self,
+        d: int,
+        num_heads: int,
+        seeds: list[int],
+        device: torch.device | str | None = None,
+    ):
+        if len(seeds) != num_heads:
+            raise ValueError(f"Expected {num_heads} seeds, got {len(seeds)}")
+        Pi_list = [RandomRotationTorch(d, seed=s, device=device).Pi for s in seeds]
+        self.Pi = torch.stack(Pi_list, dim=0)  # [H, D, D]
+        self.d = d
+        self.num_heads = num_heads
+
+    def rotate(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply y = x @ Pi^T for all heads simultaneously.
+
+        Args:
+            x: Tensor of shape (H, N, D).
+
+        Returns:
+            Rotated tensor of shape (H, N, D).
+        """
+        return torch.bmm(x, self.Pi.transpose(-1, -2))
+
+    def unrotate(self, y: torch.Tensor) -> torch.Tensor:
+        """Apply x = y @ Pi for all heads simultaneously.
+
+        Args:
+            y: Tensor of shape (H, N, D).
+
+        Returns:
+            Unrotated tensor of shape (H, N, D).
+        """
+        return torch.bmm(y, self.Pi)
