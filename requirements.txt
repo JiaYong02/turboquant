@@ -1,0 +1,10 @@
+# Core dependencies
+numpy>=1.24
+scipy>=1.10
+
+# Development dependencies
+pytest>=7.0
+pytest-cov>=4.0
+
+# Note: PyTorch with CUDA 13.0 should be installed separately with:
+# pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu130

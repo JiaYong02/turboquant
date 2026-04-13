@@ -20,6 +20,10 @@ dev = [
 gpu = [
     "torch>=2.0",
 ]
+hf = [
+    "transformers>=4.51",
+    "accelerate>=0.20",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -27,3 +31,4 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+pythonpath = ["src"]

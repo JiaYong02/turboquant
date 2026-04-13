@@ -28,8 +28,8 @@ in a production-ready llama.cpp fork with native GGML quantization types.
 | 4 | TurboQuantMSE (Algorithm 1) | Done | quantizer_mse.py, MSE-optimal pipeline |
 | 5 | TurboQuantProd (Algorithm 2) | Done | quantizer_prod.py, unbiased inner product |
 | 6 | Distortion bounds & packaging | Done | test_distortion_bounds.py, README, __init__ |
-| 7 | PyTorch backend | Planned | Port all modules to torch with GPU support |
-| 8 | KV cache integration | Planned | Architecture-agnostic HuggingFace cache hook |
+| 7 | PyTorch backend | Done | Port all modules to torch with GPU support |
+| 8 | KV cache integration | Done | Architecture-agnostic HuggingFace cache hook |
 | 9 | Evaluation suite | Planned | LongBench + perplexity benchmarks |
 | 10 | llama.cpp fork | Planned | Native GGML_TYPE_TQ{b} quantization types |
 | 11+ | Production hardening | Planned | Performance, outlier channels, CI/CD, docs |
@@ -293,7 +293,178 @@ Savings: 376 MB of VRAM.
 
 ---
 
-## Phase 9: Evaluation Suite
+
+## Phase 9 (revised): Fused Decompress-Attention Triton Kernel
+
+### Goal
+
+Implement the paper's actual speed mechanism: a fused decompress+attention
+Triton kernel that reads compressed K/V tiles directly from HBM and
+decompresses them in SRAM/registers, so the GPU attention kernel reads
+**b/16 × fewer bytes** from HBM compared to FP16. This is what the paper
+calls the HBM↔SRAM bandwidth reduction that enables ≥FP16 throughput.
+
+**Status**: Planned (after Phase 8 KV Cache Integration is validated)
+
+### Why the current drop-in HF cache cannot match FP16 speed
+
+Autoregressive decode attention is memory-bandwidth-bound (HBM reads, not
+FLOPs). The speed argument is:
+
+```
+FP16 decode attention: reads B×H×S×D×2 bytes per layer from HBM
+TurboQuant b-bit:      reads B×H×S×D×(b/8) bytes, decompresses in SRAM → b/16× reads
+```
+
+The drop-in `TurboQuantCache.update()` currently holds an fp16 dense buffer
+(`_dense_keys`/`_dense_values`) in VRAM and returns it to HF's stock attention
+kernel. Total HBM traffic = compressed (write path) + fp16 dense (read path),
+which is **more** than FP16 baseline — not less. The dense buffer is needed
+for functional correctness and to validate math; real speed requires the fused
+kernel below.
+
+### Architecture
+
+The kernel fuses two operations into one GPU kernel:
+
+```
+Standard (two kernels):
+  1. K/V decompress: HBM[compressed] → SRAM → HBM[fp16]   ← extra HBM round-trip
+  2. Attention:      HBM[Q] + HBM[fp16 K] + HBM[fp16 V] → HBM[O]
+
+Fused (one kernel):
+  1. Load Q tile from HBM to SRAM (unchanged)
+  2. Load compressed K/V tile from HBM to SRAM (b/16× smaller)
+  3. Decompress K/V tile in SRAM/registers (no HBM write)
+  4. Compute attention QK^T + softmax + V in SRAM (FlashAttention-2 tiling)
+  5. Write output O tile to HBM (unchanged)
+```
+
+Step 3 consists of: index lookup in codebook (shared memory), QJL sign
+reconstruction (bitwise), rotation unproject (register-level matmul). All
+happen before the compressed tile ever leaves SRAM.
+
+### Implementation Plan
+
+**Phase 9a: Validate math with PyTorch reference kernel**
+
+Before touching Triton, validate that the compressed K/V representation
+produces correct attention outputs using a pure-PyTorch reference:
+
+```python
+def compressed_attention_reference(q, key_store, value_store, key_quantizer, value_quantizer):
+    """Dequantize inside attention loop (reference, not fused)."""
+    # Tile over sequence blocks, dequantize one block at a time
+    # Verify output matches standard fp16 attention + full dequantize
+```
+
+Tests: `TestCompressedAttentionReference` — compare against
+`F.scaled_dot_product_attention` with full dequantized K/V. Accept atol=1e-3.
+
+**Phase 9b: Triton fused kernel (FlashAttention-2 base)**
+
+Start from the FlashAttention-2 Triton reference implementation
+(`flash_attn_triton.py` in the FA2 repo). Key modifications:
+
+| FA2 location | TurboQuant change |
+|---|---|
+| `tl.load(K_block_ptr, ...)` | Load compressed K block instead |
+| After K load | Dequantize in-register: codebook lookup + QJL sign restore + rotate |
+| `tl.load(V_block_ptr, ...)` | Load compressed V block |
+| After V load | Dequantize in-register: codebook lookup + norm rescale |
+| Block pointer stride | `b/16` fraction of FP16 stride |
+
+Triton primitives to use:
+- `tl.load` with `cache_modifier=".cg"` (cache global, skip L2 for streaming)
+- Codebook in `tl.constexpr` shared memory (small: 16 centroids × 4 bytes = 64 bytes)
+- Sign unpack: `(packed >> bit_offset) & 1` per lane
+- In-register rotation: `tl.dot(x, Pi_T)` where `Pi_T` is a register tile
+
+### New Files
+
+```
+src/turboquant/
+    kernels/
+        __init__.py
+        decompress_attn.py          # Triton fused kernel (forward pass)
+        decompress_attn_ref.py      # Pure-PyTorch reference for validation
+        codebook_cache.py           # Shared codebook constant management
+tests/
+    test_decompress_attn.py         # Reference vs full-dequant, and Triton vs reference
+scripts/
+    benchmark_fused_kernel.py       # Measure tok/s: FP16 vs drop-in vs fused
+```
+
+### Modified Files
+
+- `src/turboquant/integrations/hf_cache.py` — add optional `use_fused_kernel`
+  flag to `TurboQuantCache`; when True, skip `_dense_keys`/`_dense_values`
+  and invoke the fused kernel instead of returning dense tensors.
+- `pyproject.toml` — add `[project.optional-dependencies] triton = ["triton>=2.2"]`
+
+### Dependencies
+
+- `triton>=2.2` (ships with PyTorch 2.1+ on Linux; Windows support via WSL
+  or the triton-nightly wheel)
+- CUDA-capable GPU (RTX 5000 Ada or better for best results)
+- FlashAttention-2 Triton reference (`flash_attn` optional — kernel is
+  reimplemented from scratch based on the paper's algorithm)
+
+### Testing Strategy
+
+1. **Reference kernel tests** (CPU-runnable, no Triton required):
+   - `test_reference_matches_sdpa`: cosine similarity ≥ 0.999 between
+     `compressed_attention_reference()` and `F.scaled_dot_product_attention`
+     on random Q, K, V at b=4/3/2.
+   - `test_reference_causal_mask`: verify causal masking is applied correctly.
+
+2. **Triton kernel tests** (CUDA required):
+   - `test_triton_matches_reference`: Triton output matches PyTorch reference
+     within atol=1e-3.
+   - `test_triton_all_bitwidths`: b=2/3/4 all produce correct results.
+
+3. **Speed benchmark** (manual, not CI):
+   - `scripts/benchmark_fused_kernel.py` measures tok/s for FP16, drop-in,
+     and fused-kernel at sequence lengths 256/1024/4096.
+   - Target: fused kernel ≥ 0.9× FP16 tok/s at seq=1024, b=4.
+
+### Expected Performance
+
+For RTX 5000 Ada (16 GB/s HBM bandwidth):
+
+| Method | HBM bytes/step (L=32, H=8, D=128, S=1024) | Expected speedup |
+|---|---|---|
+| FP16 baseline | 2×8×1024×128×2 B × 32 layers | 1.0× |
+| Drop-in TQ b=4 | fp16 read + compressed write | ~0.7× (slower) |
+| **Fused TQ b=4** | **b/16 × fp16** read only | **~3–4×** |
+| **Fused TQ b=3** | **b/16 × fp16** read only | **~4–5×** |
+
+### Risks
+
+- **Triton on Windows**: The stable `triton` wheel does not support Windows
+  natively. Mitigation: develop in WSL2 on the RTX 5000 Ada machine; provide
+  a Windows fallback that uses the drop-in (dense buffer) path automatically.
+- **Rotation matmul in registers**: For head_dim=128, the in-register rotation
+  is a 128×128 matmul per tile, which may overflow registers. Mitigation:
+  investigate Hadamard transform (O(D log D), fully decomposable into butterfly
+  stages) as the paper suggests for large head_dim.
+- **Causal mask tiling**: FA2's tiling strategy handles causal masking at tile
+  granularity. The decompression step must happen before the mask is applied
+  (to avoid operating on zeroed-out tiles). This is a minor correctness detail
+  to verify during kernel testing.
+
+### Definition of Done
+
+- `TestCompressedAttentionReference` passes: cosine similarity ≥ 0.999 at b=4.
+- `TestTritonKernel` passes on CUDA (if available).
+- `scripts/benchmark_fused_kernel.py` shows fused kernel ≥ 0.9× FP16 tok/s
+  at seq=1024, b=4 on RTX 5000 Ada.
+- `TurboQuantCache(config, use_fused_kernel=True)` runs `model.generate()`
+  successfully with Llama-3.1-8B.
+
+---
+
+## Phase 10: Evaluation Suite
 
 ### Goal
 
@@ -390,7 +561,7 @@ Metrics: F1 (QA), ROUGE-L (summarization), accuracy (classification).
 
 ---
 
-## Phase 10: llama.cpp Fork
+## Phase 11: llama.cpp Fork
 
 ### Goal
 
@@ -469,7 +640,7 @@ llama-cli -m model.gguf \
 
 ### Dependencies
 
-- Phase 9 evaluation results for validation targets.
+- Phase 10 evaluation results for validation targets.
 - CMake, CUDA toolkit, C++17 compiler.
 
 ### Risks
@@ -489,9 +660,9 @@ llama-cli -m model.gguf \
 
 ---
 
-## Phase 11+: Production Hardening
+## Phase 12+: Production Hardening
 
-### 11a: Performance Optimization
+### 12a: Performance Optimization
 
 - Profile the dequantization hotpath (likely the d x d matmul for unrotation).
 - Investigate randomized Hadamard transform as O(d log d) alternative to
@@ -500,7 +671,7 @@ llama-cli -m model.gguf \
 - Explore incremental attention: compute attention scores directly from
   compressed representation without full dequantization.
 
-### 11b: Outlier Channel Strategy
+### 12b: Outlier Channel Strategy
 
 - Implement the paper's 2.5-bit and 3.5-bit configurations.
 - Per-layer outlier detection based on activation magnitude statistics.
@@ -508,23 +679,52 @@ llama-cli -m model.gguf \
 - This requires a lightweight calibration pass (small departure from the
   fully data-oblivious design, but consistent with the paper's approach).
 
-### 11c: Documentation
+### 12c: Documentation
 
 - Jupyter notebook demonstrating KV cache compression on Llama-3.1-8B.
 - API reference documentation (Sphinx or MkDocs).
 - Performance comparison charts (distortion vs bit-width, throughput vs
   sequence length).
 
-### 11d: CI/CD Pipeline
+### 12d: CI/CD Pipeline
 
 - GitHub Actions on push: pytest, ruff lint, mypy type check.
 - GPU tests on a self-hosted runner or triggered manually.
 - Benchmark regression tracking (flag if perplexity degrades > 0.5%).
 
-### 11e: Distribution
+### 12e: Distribution
 
 - PyPI package publication (once API is stable).
 - HuggingFace model cards showing TurboQuant benchmark results.
+
+### 12f: H100 / FP8 Support
+
+Target hardware: NVIDIA H100 (SM 90) with native FP8 tensor cores.
+
+**Scenario A — Weight-only FP8** (bitsandbytes / quanto / torchao)
+Model weights are stored as FP8 but activations remain BF16/FP16. `TurboQuantCache`
+already handles this correctly — `key_states` arrive as BF16/FP16. No changes needed.
+
+**Scenario B — True FP8 activations** (NVIDIA Transformer Engine)
+TE fuses scaling factors into FP8 GEMMs; `key_states` arrive as `float8_e4m3fn`.
+Support requires:
+
+- Detect FP8 input dtype in `TurboQuantCacheLayer.update()`.
+- Use TE-aware descaling (TE stores per-tensor scale factors outside the tensor,
+  passed via `model_inputs`) rather than plain `.float()`.
+- Return `float8_e4m3fn` output only if downstream attention is also TE-wrapped;
+  otherwise return BF16 (current FP8 guard behaviour).
+
+**Current status**: The FP8 guard (`model_dtype.itemsize >= 2` in `update()`)
+prevents silent corruption for Scenario B by promoting output to FP16.
+Full Scenario B support requires `transformer-engine` as a dependency and
+H100 hardware for validation. Deferred until H100 is available.
+
+**Definition of Done**:
+
+- Scenario A: complete (no changes needed).
+- Scenario B: `TurboQuantCacheLayer` round-trips correctly through a
+  `te.Linear`-wrapped attention layer on H100.
 
 ---
 
