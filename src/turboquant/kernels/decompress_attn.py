@@ -1,0 +1,415 @@
+"""Triton fused decompress+attention kernel (Phase 10, split-KV).
+
+FlashDecoding-v2 shape: two kernels.
+
+1. ``_attn_split_kernel`` — grid ``(B, H_q, NUM_SPLITS)``. Each program owns
+   ``SPLIT_SIZE`` key positions, iterates them in ``BLOCK_N`` tiles, and writes
+   its local streaming-softmax state ``(m_local, l_local, acc_local)`` to HBM
+   scratch. This is the loop body from the old single-pass kernel, now
+   parallelised over KV tiles so the grid saturates SMs at small batch.
+
+2. ``_attn_reduce_kernel`` — grid ``(B, H_q)``. Each program reads the
+   ``NUM_SPLITS`` partials for its ``(b, h_q)`` and combines them with the
+   standard streaming-softmax merge
+   ``m* = max m_i``; ``l* = Σ l_i · exp(m_i - m*)``;
+   ``acc* = Σ acc_i · exp(m_i - m*)``; ``out = acc* / l*``.
+
+``Pi_v`` is still applied once at the end in Python, outside the kernel.
+Scope: decode (S_q = 1), forward only, ``b_key ∈ {2,3,4}``, ``b_val ∈ {2,3,4}``.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+import triton
+import triton.language as tl
+
+from ..bit_packing import packed_dim
+from ..integrations.hf_cache import _BatchedKeyStore, _BatchedValueStore
+from ..quantizer_mse_torch import BatchedTurboQuantMSETorch
+from ..quantizer_prod_torch import BatchedTurboQuantProdTorch
+
+_QJL_C = math.sqrt(math.pi / 2)
+
+_SPLIT_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_N": 32},  num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_N": 64},  num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_N": 64},  num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_N": 64},  num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_N": 128}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_N": 128}, num_warps=8, num_stages=3),
+]
+
+
+@triton.autotune(
+    configs=_SPLIT_AUTOTUNE_CONFIGS,
+    key=["S_bucket", "D", "GQA_GROUPS", "MSE_BITS", "VAL_BITS", "SPLIT_SIZE"],
+)
+@triton.jit
+def _attn_split_kernel(
+    Q_rot_ptr,
+    Q_qjl_ptr,
+    qjl_packed_ptr,
+    mse_packed_ptr,
+    gamma_ptr,
+    norms_k_ptr,
+    val_idx_packed_ptr,
+    norms_v_ptr,
+    key_centroids_ptr,
+    val_centroids_ptr,
+    partials_acc_ptr,  # [B, H_q, NUM_SPLITS, D]  fp32
+    partials_m_ptr,    # [B, H_q, NUM_SPLITS]     fp32
+    partials_l_ptr,    # [B, H_q, NUM_SPLITS]     fp32
+    # strides for Q_rot/Q_qjl: [B, H_q, D]
+    sq_b, sq_h,
+    # strides for partials_acc: [B, H_q, NUM_SPLITS, D]
+    spa_b, spa_h, spa_s,
+    # strides for partials_m / partials_l: [B, H_q, NUM_SPLITS]
+    spm_b, spm_h,
+    # strides for packed K: [H_kv, B, S, Dp]
+    sqp_h, sqp_b, sqp_s,
+    smp_h, smp_b, smp_s,
+    # scalar K: [H_kv, B, S]
+    sg_h, sg_b,
+    snk_h, snk_b,
+    # V
+    svp_h, svp_b, svp_s,
+    snv_h, snv_b,
+    # shapes / constants
+    S_total,
+    S_bucket,   # autotune key — bucketed S_total
+    scale,
+    qjl_const,
+    NUM_SPLITS,
+    GQA_GROUPS: tl.constexpr,
+    D: tl.constexpr,
+    MSE_BITS: tl.constexpr,
+    VAL_BITS: tl.constexpr,
+    SPLIT_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    b_idx = tl.program_id(0)
+    hq_idx = tl.program_id(1)
+    split_idx = tl.program_id(2)
+    hkv_idx = hq_idx // GQA_GROUPS
+
+    s_base = split_idx * SPLIT_SIZE
+    s_end = tl.minimum(s_base + SPLIT_SIZE, S_total)
+
+    d_off = tl.arange(0, D)
+    q_off = b_idx * sq_b + hq_idx * sq_h + d_off
+    q_rot = tl.load(Q_rot_ptr + q_off).to(tl.float32)
+    q_qjl = tl.load(Q_qjl_ptr + q_off).to(tl.float32)
+
+    # Per-coord unpack indices
+    VPB_QJL: tl.constexpr = 8
+    qjl_byte_idx = d_off // VPB_QJL
+    qjl_shift = (VPB_QJL - 1 - (d_off % VPB_QJL)).to(tl.int32)
+
+    VPB_MSE: tl.constexpr = 8 // MSE_BITS if MSE_BITS > 0 else 1
+    mse_mask_val: tl.constexpr = (1 << MSE_BITS) - 1 if MSE_BITS > 0 else 0
+    mse_byte_idx = d_off // VPB_MSE
+    mse_shift = ((VPB_MSE - 1 - (d_off % VPB_MSE)) * MSE_BITS).to(tl.int32)
+
+    VPB_VAL: tl.constexpr = 8 // VAL_BITS
+    val_mask_val: tl.constexpr = (1 << VAL_BITS) - 1
+    val_byte_idx = d_off // VPB_VAL
+    val_shift = ((VPB_VAL - 1 - (d_off % VPB_VAL)) * VAL_BITS).to(tl.int32)
+
+    m_run = -float("inf")
+    l_run = 0.0
+    acc = tl.zeros([D], dtype=tl.float32)
+
+    kv_base_qjl = hkv_idx * sqp_h + b_idx * sqp_b
+    kv_base_mse = hkv_idx * smp_h + b_idx * smp_b
+    kv_base_g   = hkv_idx * sg_h  + b_idx * sg_b
+    kv_base_nk  = hkv_idx * snk_h + b_idx * snk_b
+    kv_base_vp  = hkv_idx * svp_h + b_idx * svp_b
+    kv_base_nv  = hkv_idx * snv_h + b_idx * snv_b
+
+    # If this split is entirely out of range, bail after writing sentinel state.
+    if s_base < S_total:
+        for s_start in range(s_base, s_end, BLOCK_N):
+            s_off = s_start + tl.arange(0, BLOCK_N)
+            s_mask = s_off < s_end  # also implies < S_total
+
+            qjl_ptrs = (
+                qjl_packed_ptr + kv_base_qjl
+                + s_off[:, None] * sqp_s + qjl_byte_idx[None, :]
+            )
+            qjl_bytes = tl.load(qjl_ptrs, mask=s_mask[:, None], other=0).to(tl.int32)
+            qjl_bits = (qjl_bytes >> qjl_shift[None, :]) & 1
+            signs = qjl_bits.to(tl.float32) * 2.0 - 1.0
+
+            if MSE_BITS > 0:
+                mse_ptrs = (
+                    mse_packed_ptr + kv_base_mse
+                    + s_off[:, None] * smp_s + mse_byte_idx[None, :]
+                )
+                mse_bytes = tl.load(mse_ptrs, mask=s_mask[:, None], other=0).to(tl.int32)
+                mse_vals = (mse_bytes >> mse_shift[None, :]) & mse_mask_val
+                key_cent = tl.load(key_centroids_ptr + mse_vals)
+            else:
+                key_cent = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+
+            gamma = tl.load(
+                gamma_ptr + kv_base_g + s_off, mask=s_mask, other=0.0
+            ).to(tl.float32)
+            norms_k = tl.load(
+                norms_k_ptr + kv_base_nk + s_off, mask=s_mask, other=0.0
+            ).to(tl.float32)
+
+            mse_dot = tl.sum(q_rot[None, :] * key_cent, axis=1)
+            qjl_dot = tl.sum(q_qjl[None, :] * signs, axis=1)
+            logits = norms_k * (mse_dot + qjl_const * gamma * qjl_dot) * scale
+            logits = tl.where(s_mask, logits, -float("inf"))
+
+            m_new = tl.maximum(m_run, tl.max(logits, axis=0))
+            alpha = tl.exp(m_run - m_new)
+            p = tl.exp(logits - m_new)
+            l_run = l_run * alpha + tl.sum(p, axis=0)
+
+            val_ptrs = (
+                val_idx_packed_ptr + kv_base_vp
+                + s_off[:, None] * svp_s + val_byte_idx[None, :]
+            )
+            v_bytes = tl.load(val_ptrs, mask=s_mask[:, None], other=0).to(tl.int32)
+            v_vals = (v_bytes >> val_shift[None, :]) & val_mask_val
+            val_cent = tl.load(val_centroids_ptr + v_vals)
+
+            norms_v = tl.load(
+                norms_v_ptr + kv_base_nv + s_off, mask=s_mask, other=0.0
+            ).to(tl.float32)
+            weights = p * norms_v
+            contrib = tl.sum(weights[:, None] * val_cent, axis=0)
+
+            acc = acc * alpha + contrib
+            m_run = m_new
+
+    # Store partials (always, so the reduce reads a valid sentinel for empty splits).
+    pm_off = b_idx * spm_b + hq_idx * spm_h + split_idx
+    tl.store(partials_m_ptr + pm_off, m_run)
+    tl.store(partials_l_ptr + pm_off, l_run)
+
+    pa_off = b_idx * spa_b + hq_idx * spa_h + split_idx * spa_s + d_off
+    tl.store(partials_acc_ptr + pa_off, acc)
+
+
+@triton.jit
+def _attn_reduce_kernel(
+    partials_acc_ptr,
+    partials_m_ptr,
+    partials_l_ptr,
+    out_ptr,
+    # strides
+    spa_b, spa_h, spa_s,
+    spm_b, spm_h,
+    so_b, so_h,
+    NUM_SPLITS,
+    D: tl.constexpr,
+    BLOCK_SPLITS: tl.constexpr,  # >= NUM_SPLITS, power of 2
+):
+    b_idx = tl.program_id(0)
+    hq_idx = tl.program_id(1)
+
+    s_off = tl.arange(0, BLOCK_SPLITS)
+    s_mask = s_off < NUM_SPLITS
+
+    pm_off = b_idx * spm_b + hq_idx * spm_h + s_off
+    m_i = tl.load(partials_m_ptr + pm_off, mask=s_mask, other=-float("inf"))
+    l_i = tl.load(partials_l_ptr + pm_off, mask=s_mask, other=0.0)
+
+    m_star = tl.max(m_i, axis=0)
+    scale_i = tl.exp(m_i - m_star)
+    l_star = tl.sum(l_i * scale_i, axis=0)
+
+    d_off = tl.arange(0, D)
+    # acc[s, d] = partials_acc[b, hq, s, d]
+    pa_off = (
+        b_idx * spa_b + hq_idx * spa_h
+        + s_off[:, None] * spa_s + d_off[None, :]
+    )
+    acc_i = tl.load(pa_off + partials_acc_ptr, mask=s_mask[:, None], other=0.0)
+    acc_star = tl.sum(acc_i * scale_i[:, None], axis=0)
+
+    out = acc_star / l_star
+    out_off = b_idx * so_b + hq_idx * so_h + d_off
+    tl.store(out_ptr + out_off, out)
+
+
+def _key_centroid_lut(kq: BatchedTurboQuantProdTorch) -> torch.Tensor:
+    if kq.mse is None:
+        return torch.zeros(1, dtype=torch.float32)
+    return kq.mse.codebook._centroids.to(torch.float32).contiguous()
+
+
+def _val_centroid_lut(vq: BatchedTurboQuantMSETorch) -> torch.Tensor:
+    return vq.codebook._centroids.to(torch.float32).contiguous()
+
+
+def _next_pow2(x: int) -> int:
+    return 1 << max(0, (x - 1).bit_length())
+
+
+def _s_bucket(s: int) -> int:
+    for b in (256, 1024, 4096, 16384, 65536):
+        if s <= b:
+            return b
+    return _next_pow2(s)
+
+
+def _pick_split_size(S_total: int, B: int, H_q: int, sm_count: int = 132) -> int:
+    """Pick SPLIT_SIZE so grid (B*H_q*NUM_SPLITS) saturates SMs (>= 2x sm_count)."""
+    target = max(1, 2 * sm_count // max(1, B * H_q))
+    # NUM_SPLITS >= target  ⇒  SPLIT_SIZE <= S_total / target
+    if target <= 1 or S_total <= 64:
+        return max(64, _next_pow2(S_total))
+    split = max(32, _next_pow2(max(32, S_total // target)))
+    # Clamp to avoid pathological tiny splits.
+    return min(split, max(64, S_total))
+
+
+def fused_decompress_attention_triton(
+    q: torch.Tensor,
+    key_store: _BatchedKeyStore,
+    value_store: _BatchedValueStore,
+    key_quantizer: BatchedTurboQuantProdTorch,
+    value_quantizer: BatchedTurboQuantMSETorch,
+    scale: float | None = None,
+    split_size: int | None = None,
+    block_n: int | None = None,  # deprecated: BLOCK_N is autotuned now
+) -> torch.Tensor:
+    """Fused decompress+attention via Triton (FlashDecoding split-KV), decode-only."""
+    if q.dim() != 4 or q.shape[2] != 1:
+        raise ValueError(f"expected q shape [B,H_q,1,D], got {tuple(q.shape)}")
+    if not q.is_cuda:
+        raise RuntimeError("Triton fused kernel requires a CUDA device")
+    if key_store.qjl_packed is None or value_store.idx_packed is None:
+        raise ValueError("KV store is empty")
+
+    B, H_q, _, D = q.shape
+    H_kv = key_quantizer.num_heads
+    if H_q % H_kv != 0:
+        raise ValueError(f"H_q={H_q} not divisible by H_kv={H_kv}")
+    gqa_groups = H_q // H_kv
+
+    S_total = key_store.seq_length()
+    if S_total == 0:
+        return torch.zeros_like(q)
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(D)
+
+    device = q.device
+    in_dtype = q.dtype
+    key_bits = key_quantizer.b
+    value_bits = value_quantizer.b
+    mse_bits = key_bits - 1
+
+    # --- Folded-rotation trick --------------------------------------------
+    q_f32 = q.to(torch.float32).squeeze(2).contiguous()  # [B, H_q, D]
+    kv_for_q = torch.arange(H_q, device=device) // gqa_groups
+
+    S_k = key_quantizer.qjl.S.to(device=device, dtype=torch.float32)
+    S_k_per_q = S_k.index_select(0, kv_for_q)
+    Q_qjl = torch.einsum("bhd,hed->bhe", q_f32, S_k_per_q).contiguous()
+
+    if mse_bits > 0:
+        Pi_k = key_quantizer.mse.rotation.Pi.to(device=device, dtype=torch.float32)
+        Pi_k_per_q = Pi_k.index_select(0, kv_for_q)
+        Q_rot = torch.einsum("bhd,hed->bhe", q_f32, Pi_k_per_q).contiguous()
+    else:
+        Q_rot = torch.zeros_like(Q_qjl)
+
+    # --- Gather packed tensors --------------------------------------------
+    qjl_packed = key_store.qjl_packed.contiguous()
+    gamma = key_store.gamma.contiguous().to(torch.float32)
+    norms_k = key_store.norms.contiguous().to(torch.float32)
+    if key_store.mse_packed is not None:
+        mse_packed = key_store.mse_packed.contiguous()
+    else:
+        mse_packed = torch.zeros(1, dtype=torch.uint8, device=device)
+
+    val_idx_packed = value_store.idx_packed.contiguous()
+    norms_v = value_store.norms.contiguous().to(torch.float32)
+
+    key_cent_lut = _key_centroid_lut(key_quantizer).to(device).contiguous()
+    val_cent_lut = _val_centroid_lut(value_quantizer).to(device).contiguous()
+
+    # --- Split sizing ------------------------------------------------------
+    if split_size is None:
+        split_size = _pick_split_size(S_total, B, H_q)
+    split_size = max(32, int(split_size))
+    num_splits = (S_total + split_size - 1) // split_size
+
+    # --- Partial + output scratch -----------------------------------------
+    partials_acc = torch.empty(B, H_q, num_splits, D, dtype=torch.float32, device=device)
+    partials_m = torch.empty(B, H_q, num_splits, dtype=torch.float32, device=device)
+    partials_l = torch.empty(B, H_q, num_splits, dtype=torch.float32, device=device)
+    out_rot = torch.empty(B, H_q, D, dtype=torch.float32, device=device)
+
+    def st(t: torch.Tensor) -> list[int]:
+        return list(t.stride())
+
+    sqrot = st(q_f32)                         # [B,H_q,D]
+    sqjlp = st(qjl_packed)
+    smsep = st(mse_packed) if mse_packed.dim() == 4 else [0, 0, 0, 0]
+    sg = st(gamma)
+    snk = st(norms_k)
+    svp = st(val_idx_packed)
+    snv = st(norms_v)
+    spa = st(partials_acc)                    # [B,H_q,NS,D]
+    spm = st(partials_m)                      # [B,H_q,NS]
+    sor = st(out_rot)                         # [B,H_q,D]
+
+    S_bucket = _s_bucket(S_total)
+    grid_split = (B, H_q, num_splits)
+    _attn_split_kernel[grid_split](
+        Q_rot, Q_qjl,
+        qjl_packed, mse_packed,
+        gamma, norms_k,
+        val_idx_packed, norms_v,
+        key_cent_lut, val_cent_lut,
+        partials_acc, partials_m, partials_l,
+        sqrot[0], sqrot[1],
+        spa[0], spa[1], spa[2],
+        spm[0], spm[1],
+        sqjlp[0], sqjlp[1], sqjlp[2],
+        smsep[0], smsep[1], smsep[2],
+        sg[0], sg[1],
+        snk[0], snk[1],
+        svp[0], svp[1], svp[2],
+        snv[0], snv[1],
+        S_total,
+        S_bucket,
+        float(scale),
+        float(_QJL_C / D),
+        num_splits,
+        GQA_GROUPS=gqa_groups,
+        D=D,
+        MSE_BITS=mse_bits,
+        VAL_BITS=value_bits,
+        SPLIT_SIZE=split_size,
+    )
+
+    block_splits = max(2, _next_pow2(num_splits))
+    grid_reduce = (B, H_q)
+    _attn_reduce_kernel[grid_reduce](
+        partials_acc, partials_m, partials_l,
+        out_rot,
+        spa[0], spa[1], spa[2],
+        spm[0], spm[1],
+        sor[0], sor[1],
+        num_splits,
+        D=D,
+        BLOCK_SPLITS=block_splits,
+    )
+
+    # --- Apply Pi_v once (rotated → canonical V-space) --------------------
+    Pi_v = value_quantizer.rotation.Pi.to(device=device, dtype=torch.float32)
+    Pi_v_per_q = Pi_v.index_select(0, kv_for_q)
+    out = torch.einsum("bhd,hde->bhe", out_rot, Pi_v_per_q)
+
+    return out.unsqueeze(2).to(in_dtype)

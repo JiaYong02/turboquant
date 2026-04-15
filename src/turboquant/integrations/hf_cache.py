@@ -254,6 +254,7 @@ class TurboQuantCacheLayer(CacheLayerMixin):
         value_bits: int = 4,
         seed: int = 42,
         device: torch.device | str | None = None,
+        use_fused_kernel: bool = False,
     ):
         super().__init__()
         self._layer_idx = layer_idx
@@ -264,6 +265,7 @@ class TurboQuantCacheLayer(CacheLayerMixin):
         self._seed = seed
         self._target_device = device
         self._seq_length = 0
+        self._use_fused_kernel = use_fused_kernel
 
         seed_base = seed + layer_idx * 1000
 
@@ -345,6 +347,14 @@ class TurboQuantCacheLayer(CacheLayerMixin):
         self._key_store.append(q_k, norms_k, B, S_new)
         self._value_store.append(q_v, norms_v, B, S_new)
         self._seq_length += S_new
+
+        # Fused-kernel fast path: skip dense buffer growth on decode. The custom
+        # attention hook reads directly from the compressed stores; what we
+        # return here is ignored for decode steps. Prefill (S_new > 1) still
+        # needs dense K/V because the fused kernel is decode-only.
+        if self._use_fused_kernel and S_new == 1 and self._seq_length > 1:
+            empty = key_states.new_empty(0)
+            return empty, empty
 
         # Dequantize only the NEW tokens (O(S_new), not O(S_total)).
         # q_k / q_v already have the right shapes [H, B*S_new, D] — pass directly.
@@ -498,6 +508,7 @@ class TurboQuantCache(Cache):
         per_layer_bits: dict[int, dict[str, int]] | None = None,
         seed: int = 42,
         device: torch.device | str | None = None,
+        use_fused_kernel: bool = False,
     ):
         text_config = config.get_text_config(decoder=True)
         num_layers = text_config.num_hidden_layers
@@ -526,6 +537,7 @@ class TurboQuantCache(Cache):
                     value_bits=vb,
                     seed=seed,
                     device=device,
+                    use_fused_kernel=use_fused_kernel,
                 )
             )
 
@@ -536,3 +548,10 @@ class TurboQuantCache(Cache):
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
         self._head_dim = head_dim
+        self._use_fused_kernel = use_fused_kernel
+
+    def bind(self):
+        """Context manager: route the fused attention hook to this cache."""
+        from .attention import bind_cache
+
+        return bind_cache(self)
