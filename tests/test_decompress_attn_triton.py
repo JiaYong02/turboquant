@@ -84,6 +84,36 @@ def test_triton_block_n_invariance(block_n):
 
 
 @cuda
+@pytest.mark.parametrize("key_bits,value_bits", [(4, 4), (2, 2)])
+def test_triton_precomputed_rotations_match_cold(key_bits, value_bits):
+    """Passing cached per-Q-head rotations must produce identical output."""
+    B, H_kv, gqa, S, D = 1, 4, 2, 256, 64
+    H_q = H_kv * gqa
+    ks, vs, kq, vq = _build_state(B, H_kv, S, D, key_bits, value_bits, seed=11)
+    q = torch.randn(B, H_q, 1, D, device="cuda")
+
+    kv_for_q = torch.arange(H_q, device="cuda") // gqa
+    S_k = kq.qjl.S.to(device="cuda", dtype=torch.float32).index_select(
+        0, kv_for_q
+    ).contiguous()
+    Pi_v = vq.rotation.Pi.to(device="cuda", dtype=torch.float32).index_select(
+        0, kv_for_q
+    ).contiguous()
+    Pi_k = None
+    if key_bits - 1 > 0:
+        Pi_k = kq.mse.rotation.Pi.to(device="cuda", dtype=torch.float32).index_select(
+            0, kv_for_q
+        ).contiguous()
+
+    out_cold = fused_decompress_attention_triton(q, ks, vs, kq, vq)
+    out_warm = fused_decompress_attention_triton(
+        q, ks, vs, kq, vq,
+        pi_k_per_q=Pi_k, s_k_per_q=S_k, pi_v_per_q=Pi_v, kv_for_q=kv_for_q,
+    )
+    torch.testing.assert_close(out_warm, out_cold, atol=0, rtol=0)
+
+
+@cuda
 def test_triton_llama_shape():
     """Shape and sizes representative of Llama-3.1-8B per-layer KV cache."""
     B, H_kv, gqa, S, D = 1, 8, 4, 512, 128

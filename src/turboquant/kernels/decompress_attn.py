@@ -21,6 +21,7 @@ Scope: decode (S_q = 1), forward only, ``b_key ∈ {2,3,4}``, ``b_val ∈ {2,3,4
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 import triton
@@ -77,8 +78,10 @@ def _attn_split_kernel(
     # V
     svp_h, svp_b, svp_s,
     snv_h, snv_b,
-    # shapes / constants
-    S_total,
+    # device scalar: 0-d int32 tensor holding current seq_len; loaded at
+    # kernel entry so one captured CUDA graph can serve all S_total values
+    # within a bucket.
+    s_total_ptr,
     S_bucket,   # autotune key — bucketed S_total
     scale,
     qjl_const,
@@ -95,6 +98,7 @@ def _attn_split_kernel(
     split_idx = tl.program_id(2)
     hkv_idx = hq_idx // GQA_GROUPS
 
+    S_total = tl.load(s_total_ptr)
     s_base = split_idx * SPLIT_SIZE
     s_end = tl.minimum(s_base + SPLIT_SIZE, S_total)
 
@@ -271,6 +275,28 @@ def _pick_split_size(S_total: int, B: int, H_q: int, sm_count: int = 132) -> int
     return min(split, max(64, S_total))
 
 
+@dataclass
+class FusedAttnScratch:
+    """Long-lived scratch buffers for CUDA-graph decode.
+
+    Shapes must accommodate the bucket's worst case:
+      partials_acc: [B, H_q, num_splits_max, D]  fp32
+      partials_m:   [B, H_q, num_splits_max]     fp32
+      partials_l:   [B, H_q, num_splits_max]     fp32
+      out_rot:      [B, H_q, D]                  fp32
+
+    Q_qjl / Q_rot are allocated inline by the einsum calls in the wrapper; under
+    capture their storage is pool-owned and stable for replay, so binding them
+    via this dataclass buys nothing.
+    """
+    partials_acc: torch.Tensor
+    partials_m: torch.Tensor
+    partials_l: torch.Tensor
+    out_rot: torch.Tensor
+    num_splits_max: int
+    split_size: int
+
+
 def fused_decompress_attention_triton(
     q: torch.Tensor,
     key_store: _BatchedKeyStore,
@@ -280,6 +306,14 @@ def fused_decompress_attention_triton(
     scale: float | None = None,
     split_size: int | None = None,
     block_n: int | None = None,  # deprecated: BLOCK_N is autotuned now
+    pi_k_per_q: torch.Tensor | None = None,
+    s_k_per_q: torch.Tensor | None = None,
+    pi_v_per_q: torch.Tensor | None = None,
+    kv_for_q: torch.Tensor | None = None,
+    key_cent_lut: torch.Tensor | None = None,
+    val_cent_lut: torch.Tensor | None = None,
+    s_total_tensor: torch.Tensor | None = None,
+    scratch: "FusedAttnScratch | None" = None,
 ) -> torch.Tensor:
     """Fused decompress+attention via Triton (FlashDecoding split-KV), decode-only."""
     if q.dim() != 4 or q.shape[2] != 1:
@@ -309,21 +343,37 @@ def fused_decompress_attention_triton(
     mse_bits = key_bits - 1
 
     # --- Folded-rotation trick --------------------------------------------
+    # Per-Q-head rotation matrices (S_k_per_q, Pi_k_per_q, Pi_v_per_q) are
+    # invariant for the lifetime of a cache layer; callers (e.g.
+    # TurboQuantCacheLayer._prepare_fused_state) can pass them in to skip the
+    # per-call index_select + fp32 cast, which dominates decode latency at
+    # short sequences. Fall back to cold computation when not provided.
     q_f32 = q.to(torch.float32).squeeze(2).contiguous()  # [B, H_q, D]
-    kv_for_q = torch.arange(H_q, device=device) // gqa_groups
+    if kv_for_q is None:
+        kv_for_q = torch.arange(H_q, device=device) // gqa_groups
 
-    S_k = key_quantizer.qjl.S.to(device=device, dtype=torch.float32)
-    S_k_per_q = S_k.index_select(0, kv_for_q)
-    Q_qjl = torch.einsum("bhd,hed->bhe", q_f32, S_k_per_q).contiguous()
+    if s_k_per_q is None:
+        S_k = key_quantizer.qjl.S.to(device=device, dtype=torch.float32)
+        s_k_per_q = S_k.index_select(0, kv_for_q).contiguous()
+    # Under CUDA-graph capture, the output of einsum gets allocated in the
+    # graph's memory pool and its pointer is fixed for the life of the capture,
+    # so we don't need an explicit scratch binding here.
+    Q_qjl = torch.einsum("bhd,hed->bhe", q_f32, s_k_per_q).contiguous()
 
     if mse_bits > 0:
-        Pi_k = key_quantizer.mse.rotation.Pi.to(device=device, dtype=torch.float32)
-        Pi_k_per_q = Pi_k.index_select(0, kv_for_q)
-        Q_rot = torch.einsum("bhd,hed->bhe", q_f32, Pi_k_per_q).contiguous()
+        if pi_k_per_q is None:
+            Pi_k = key_quantizer.mse.rotation.Pi.to(device=device, dtype=torch.float32)
+            pi_k_per_q = Pi_k.index_select(0, kv_for_q).contiguous()
+        Q_rot = torch.einsum("bhd,hed->bhe", q_f32, pi_k_per_q).contiguous()
     else:
         Q_rot = torch.zeros_like(Q_qjl)
 
     # --- Gather packed tensors --------------------------------------------
+    # The Triton kernel requires fp32 for gamma / norms_k / norms_v. We
+    # *intentionally* do not pin fp32 at store time — the quantizer currently
+    # emits fp32, so `.to(torch.float32)` below is a zero-copy no-op in the
+    # common case, while leaving room for a future memory-saving narrower
+    # storage dtype without touching this wrapper.
     qjl_packed = key_store.qjl_packed.contiguous()
     gamma = key_store.gamma.contiguous().to(torch.float32)
     norms_k = key_store.norms.contiguous().to(torch.float32)
@@ -335,20 +385,35 @@ def fused_decompress_attention_triton(
     val_idx_packed = value_store.idx_packed.contiguous()
     norms_v = value_store.norms.contiguous().to(torch.float32)
 
-    key_cent_lut = _key_centroid_lut(key_quantizer).to(device).contiguous()
-    val_cent_lut = _val_centroid_lut(value_quantizer).to(device).contiguous()
+    if key_cent_lut is None:
+        key_cent_lut = _key_centroid_lut(key_quantizer).to(device).contiguous()
+    if val_cent_lut is None:
+        val_cent_lut = _val_centroid_lut(value_quantizer).to(device).contiguous()
 
     # --- Split sizing ------------------------------------------------------
-    if split_size is None:
-        split_size = _pick_split_size(S_total, B, H_q)
-    split_size = max(32, int(split_size))
-    num_splits = (S_total + split_size - 1) // split_size
+    if scratch is not None:
+        split_size = scratch.split_size
+        num_splits = scratch.num_splits_max
+    else:
+        if split_size is None:
+            split_size = _pick_split_size(S_total, B, H_q)
+        split_size = max(32, int(split_size))
+        num_splits = (S_total + split_size - 1) // split_size
 
     # --- Partial + output scratch -----------------------------------------
-    partials_acc = torch.empty(B, H_q, num_splits, D, dtype=torch.float32, device=device)
-    partials_m = torch.empty(B, H_q, num_splits, dtype=torch.float32, device=device)
-    partials_l = torch.empty(B, H_q, num_splits, dtype=torch.float32, device=device)
-    out_rot = torch.empty(B, H_q, D, dtype=torch.float32, device=device)
+    if scratch is not None:
+        partials_acc = scratch.partials_acc
+        partials_m = scratch.partials_m
+        partials_l = scratch.partials_l
+        out_rot = scratch.out_rot
+    else:
+        partials_acc = torch.empty(B, H_q, num_splits, D, dtype=torch.float32, device=device)
+        partials_m = torch.empty(B, H_q, num_splits, dtype=torch.float32, device=device)
+        partials_l = torch.empty(B, H_q, num_splits, dtype=torch.float32, device=device)
+        out_rot = torch.empty(B, H_q, D, dtype=torch.float32, device=device)
+
+    if s_total_tensor is None:
+        s_total_tensor = torch.tensor(S_total, dtype=torch.int32, device=device)
 
     def st(t: torch.Tensor) -> list[int]:
         return list(t.stride())
@@ -382,7 +447,7 @@ def fused_decompress_attention_triton(
         snk[0], snk[1],
         svp[0], svp[1], svp[2],
         snv[0], snv[1],
-        S_total,
+        s_total_tensor,
         S_bucket,
         float(scale),
         float(_QJL_C / D),
@@ -408,8 +473,9 @@ def fused_decompress_attention_triton(
     )
 
     # --- Apply Pi_v once (rotated → canonical V-space) --------------------
-    Pi_v = value_quantizer.rotation.Pi.to(device=device, dtype=torch.float32)
-    Pi_v_per_q = Pi_v.index_select(0, kv_for_q)
-    out = torch.einsum("bhd,hde->bhe", out_rot, Pi_v_per_q)
+    if pi_v_per_q is None:
+        Pi_v = value_quantizer.rotation.Pi.to(device=device, dtype=torch.float32)
+        pi_v_per_q = Pi_v.index_select(0, kv_for_q).contiguous()
+    out = torch.einsum("bhd,hde->bhe", out_rot, pi_v_per_q)
 
     return out.unsqueeze(2).to(in_dtype)

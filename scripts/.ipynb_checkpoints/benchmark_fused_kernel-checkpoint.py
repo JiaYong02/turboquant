@@ -15,26 +15,10 @@ import time
 import torch
 import torch.nn.functional as F
 
-from turboquant.integrations.hf_cache import (
-    TurboQuantCache,
-    _BatchedKeyStore,
-    _BatchedValueStore,
-)
+from turboquant.integrations.hf_cache import _BatchedKeyStore, _BatchedValueStore
 from turboquant.kernels.decompress_attn import fused_decompress_attention_triton
 from turboquant.quantizer_mse_torch import BatchedTurboQuantMSETorch
 from turboquant.quantizer_prod_torch import BatchedTurboQuantProdTorch
-
-
-class _MockConfig:
-    def __init__(self, num_layers, num_kv_heads, num_attention_heads, head_dim):
-        self.num_hidden_layers = num_layers
-        self.num_key_value_heads = num_kv_heads
-        self.num_attention_heads = num_attention_heads
-        self.head_dim = head_dim
-        self.hidden_size = num_attention_heads * head_dim
-
-    def get_text_config(self, decoder: bool = True):
-        return self
 
 
 def build_state(B, H_kv, S, D, key_bits, value_bits, device):
@@ -77,17 +61,6 @@ def main():
     ap.add_argument("--seq", type=int, default=1024)
     ap.add_argument("--bits", type=int, default=4)
     ap.add_argument("--batch", type=int, default=1)
-    ap.add_argument(
-        "--cuda-graph",
-        action="store_true",
-        help="Also time the fused+CUDA-graph decode path.",
-    )
-    ap.add_argument(
-        "--max-seq-len",
-        type=int,
-        default=None,
-        help="Slab capacity for --cuda-graph (default: 2× --seq).",
-    )
     args = ap.parse_args()
 
     device = "cuda"
@@ -117,7 +90,7 @@ def main():
         v_full = v_full.repeat_interleave(gqa, dim=1)
         return F.scaled_dot_product_attention(q_fp16, k_full, v_full)
 
-    # 3. Fused Triton (eager)
+    # 3. Fused Triton
     def fused():
         return fused_decompress_attention_triton(q_fp16, ks, vs, kq, vq, block_n=64)
 
@@ -129,41 +102,6 @@ def main():
     print(f"  FP16 SDPA (dense):   {t_sdpa:.3f} ms  (1.00x baseline)")
     print(f"  Drop-in dequant+SDPA:{t_drop:.3f} ms  ({t_sdpa/t_drop:.2f}x)")
     print(f"  Triton fused:        {t_fused:.3f} ms  ({t_sdpa/t_fused:.2f}x)")
-
-    if args.cuda_graph:
-        max_seq_len = args.max_seq_len or max(256, 2 * S)
-        config = _MockConfig(
-            num_layers=1, num_kv_heads=H_kv, num_attention_heads=H_q, head_dim=D
-        )
-        cache = TurboQuantCache(
-            config,
-            key_bits=args.bits,
-            value_bits=args.bits,
-            device=device,
-            use_fused_kernel=True,
-            max_seq_len=max_seq_len,
-            use_cuda_graph=True,
-        )
-        layer = cache.layers[0]
-
-        k_prefill = torch.randn(B, H_kv, S, D, device=device, dtype=torch.float16)
-        v_prefill = torch.randn(B, H_kv, S, D, device=device, dtype=torch.float16)
-        layer.update(k_prefill, v_prefill)
-        layer._prepare_fused_state(q_fp16.device, H_q)
-        scale = 1.0 / math.sqrt(D)
-
-        # One warmup replay to pay capture cost up front.
-        with torch.inference_mode():
-            _ = layer._fused_graph_forward(q_fp16, scale)
-
-        def graph():
-            with torch.inference_mode():
-                return layer._fused_graph_forward(q_fp16, scale)
-
-        t_graph = timed(graph)
-        print(
-            f"  Triton fused+graph:  {t_graph:.3f} ms  ({t_sdpa/t_graph:.2f}x)"
-        )
 
 
 if __name__ == "__main__":

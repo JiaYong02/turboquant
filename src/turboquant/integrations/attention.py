@@ -69,14 +69,31 @@ def turboquant_fused_attention_forward(
 
         layer = cache.layers[layer_idx]
         if layer._key_store.seq_length() > 0:
-            out = fused_decompress_attention_triton(
-                query,
-                layer._key_store,
-                layer._value_store,
-                layer._key_quantizer,
-                layer._value_quantizer,
-                scale=scaling,
+            layer._prepare_fused_state(query.device, query.shape[1])
+
+            graph_eligible = (
+                getattr(layer, "_use_cuda_graph", False)
+                and getattr(layer, "_slab_preallocated", False)
+                and not torch.is_grad_enabled()
+                and query.is_cuda
             )
+            if graph_eligible:
+                out = layer._fused_graph_forward(query, scaling)
+            else:
+                out = fused_decompress_attention_triton(
+                    query,
+                    layer._key_store,
+                    layer._value_store,
+                    layer._key_quantizer,
+                    layer._value_quantizer,
+                    scale=scaling,
+                    pi_k_per_q=layer._Pi_k_per_q,
+                    s_k_per_q=layer._S_k_per_q,
+                    pi_v_per_q=layer._Pi_v_per_q,
+                    kv_for_q=layer._kv_for_q,
+                    key_cent_lut=layer._key_cent_lut,
+                    val_cent_lut=layer._val_cent_lut,
+                )
             # sdpa_attention_forward returns [B, S_q, H_q, D] (it transposes
             # [B, H_q, S_q, D] → [B, S_q, H_q, D] before returning).
             return out.transpose(1, 2).contiguous(), None
