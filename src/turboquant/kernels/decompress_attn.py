@@ -50,8 +50,9 @@ _SPLIT_AUTOTUNE_CONFIGS = [
 )
 @triton.jit
 def _attn_split_kernel(
-    Q_rot_ptr,
-    Q_qjl_ptr,
+    q_ptr,              # [B, H_q, D]      native dtype (fp16/bf16/fp32)
+    s_k_ptr,            # [H_q, D, D]      fp32 (QJL per-Q-head basis)
+    pi_k_ptr,           # [H_q, D, D]      fp32 (MSE per-Q-head rotation); ignored when MSE_BITS=0
     qjl_packed_ptr,
     mse_packed_ptr,
     gamma_ptr,
@@ -63,8 +64,11 @@ def _attn_split_kernel(
     partials_acc_ptr,  # [B, H_q, NUM_SPLITS, D]  fp32
     partials_m_ptr,    # [B, H_q, NUM_SPLITS]     fp32
     partials_l_ptr,    # [B, H_q, NUM_SPLITS]     fp32
-    # strides for Q_rot/Q_qjl: [B, H_q, D]
+    # strides for q: [B, H_q, D]
     sq_b, sq_h,
+    # strides for s_k / pi_k: [H_q, D, D]; last-dim stride assumed contiguous
+    ssk_h, ssk_e,
+    spi_h, spi_e,
     # strides for partials_acc: [B, H_q, NUM_SPLITS, D]
     spa_b, spa_h, spa_s,
     # strides for partials_m / partials_l: [B, H_q, NUM_SPLITS]
@@ -103,9 +107,22 @@ def _attn_split_kernel(
     s_end = tl.minimum(s_base + SPLIT_SIZE, S_total)
 
     d_off = tl.arange(0, D)
+    e_off = tl.arange(0, D)
+    # Load q once and compute q_qjl = q @ S_k[hq], q_rot = q @ Pi_k[hq] in
+    # registers. einsum("bhd,hed->bhe", q, X) — X[hq, e, d] multiplied across d.
     q_off = b_idx * sq_b + hq_idx * sq_h + d_off
-    q_rot = tl.load(Q_rot_ptr + q_off).to(tl.float32)
-    q_qjl = tl.load(Q_qjl_ptr + q_off).to(tl.float32)
+    q_d = tl.load(q_ptr + q_off).to(tl.float32)
+    sk_tile = tl.load(
+        s_k_ptr + hq_idx * ssk_h + e_off[:, None] * ssk_e + d_off[None, :]
+    )
+    q_qjl = tl.sum(q_d[None, :] * sk_tile, axis=1)
+    if MSE_BITS > 0:
+        pi_tile = tl.load(
+            pi_k_ptr + hq_idx * spi_h + e_off[:, None] * spi_e + d_off[None, :]
+        )
+        q_rot = tl.sum(q_d[None, :] * pi_tile, axis=1)
+    else:
+        q_rot = tl.zeros([D], dtype=tl.float32)
 
     # Per-coord unpack indices
     VPB_QJL: tl.constexpr = 8
@@ -206,10 +223,12 @@ def _attn_reduce_kernel(
     partials_acc_ptr,
     partials_m_ptr,
     partials_l_ptr,
+    pi_v_ptr,           # [H_q, D, D] fp32 — canonical-V rotation matrix
     out_ptr,
     # strides
     spa_b, spa_h, spa_s,
     spm_b, spm_h,
+    spv_h, spv_d,       # pi_v: [H_q, D, D], last-dim stride assumed contiguous
     so_b, so_h,
     NUM_SPLITS,
     D: tl.constexpr,
@@ -230,16 +249,22 @@ def _attn_reduce_kernel(
     l_star = tl.sum(l_i * scale_i, axis=0)
 
     d_off = tl.arange(0, D)
+    e_off = tl.arange(0, D)
     # acc[s, d] = partials_acc[b, hq, s, d]
     pa_off = (
         b_idx * spa_b + hq_idx * spa_h
         + s_off[:, None] * spa_s + d_off[None, :]
     )
     acc_i = tl.load(pa_off + partials_acc_ptr, mask=s_mask[:, None], other=0.0)
-    acc_star = tl.sum(acc_i * scale_i[:, None], axis=0)
+    acc_star = tl.sum(acc_i * scale_i[:, None], axis=0)  # [D] in rotated-V space
 
-    out = acc_star / l_star
-    out_off = b_idx * so_b + hq_idx * so_h + d_off
+    # Fold Pi_v: out[e] = sum_d acc_star[d] * pi_v[h_q, d, e] / l_star
+    pi_v_tile = tl.load(
+        pi_v_ptr + hq_idx * spv_h + d_off[:, None] * spv_d + e_off[None, :]
+    )
+    out = tl.sum(acc_star[:, None] * pi_v_tile, axis=0) / l_star
+
+    out_off = b_idx * so_b + hq_idx * so_h + e_off
     tl.store(out_ptr + out_off, out)
 
 
@@ -255,6 +280,23 @@ def _val_centroid_lut(vq: BatchedTurboQuantMSETorch) -> torch.Tensor:
 
 def _next_pow2(x: int) -> int:
     return 1 << max(0, (x - 1).bit_length())
+
+
+_DUMMY_PI_K_CACHE: dict[tuple[str, int, int], torch.Tensor] = {}
+
+
+def _dummy_pi_k(device: torch.device, H_q: int, D: int) -> torch.Tensor:
+    """Return a cached dummy Pi_k tensor for MSE_BITS=0 kernel invocations.
+
+    The kernel only reads from this pointer when MSE_BITS>0 so the contents
+    don't matter; what matters is a stable, valid device pointer.
+    """
+    key = (str(device), H_q, D)
+    t = _DUMMY_PI_K_CACHE.get(key)
+    if t is None:
+        t = torch.empty((H_q, D, D), dtype=torch.float32, device=device)
+        _DUMMY_PI_K_CACHE[key] = t
+    return t
 
 
 def _s_bucket(s: int) -> int:
@@ -283,16 +325,16 @@ class FusedAttnScratch:
       partials_acc: [B, H_q, num_splits_max, D]  fp32
       partials_m:   [B, H_q, num_splits_max]     fp32
       partials_l:   [B, H_q, num_splits_max]     fp32
-      out_rot:      [B, H_q, D]                  fp32
+      out:          [B, H_q, D]                  fp32 (canonical V-space)
 
-    Q_qjl / Q_rot are allocated inline by the einsum calls in the wrapper; under
-    capture their storage is pool-owned and stable for replay, so binding them
-    via this dataclass buys nothing.
+    Q-side rotations (q @ S_k, q @ Pi_k) are fused into ``_attn_split_kernel``
+    as of Phase 12A. Pi_v is fused into ``_attn_reduce_kernel`` as of 12B, so
+    ``out`` already lives in canonical V-space — no post-kernel einsum needed.
     """
     partials_acc: torch.Tensor
     partials_m: torch.Tensor
     partials_l: torch.Tensor
-    out_rot: torch.Tensor
+    out: torch.Tensor
     num_splits_max: int
     split_size: int
 
@@ -346,44 +388,45 @@ def fused_decompress_attention_triton(
     # Per-Q-head rotation matrices (S_k_per_q, Pi_k_per_q, Pi_v_per_q) are
     # invariant for the lifetime of a cache layer; callers (e.g.
     # TurboQuantCacheLayer._prepare_fused_state) can pass them in to skip the
-    # per-call index_select + fp32 cast, which dominates decode latency at
-    # short sequences. Fall back to cold computation when not provided.
-    q_f32 = q.to(torch.float32).squeeze(2).contiguous()  # [B, H_q, D]
+    # per-call index_select + fp32 cast. Phase 12A folds the q @ S_k and
+    # q @ Pi_k mat-vecs into the split kernel itself — q is loaded once in
+    # native dtype and rotated in-register.
+    q_3d = q.squeeze(2).contiguous()  # [B, H_q, D] in native dtype
     if kv_for_q is None:
         kv_for_q = torch.arange(H_q, device=device) // gqa_groups
 
     if s_k_per_q is None:
         S_k = key_quantizer.qjl.S.to(device=device, dtype=torch.float32)
         s_k_per_q = S_k.index_select(0, kv_for_q).contiguous()
-    # Under CUDA-graph capture, the output of einsum gets allocated in the
-    # graph's memory pool and its pointer is fixed for the life of the capture,
-    # so we don't need an explicit scratch binding here.
-    Q_qjl = torch.einsum("bhd,hed->bhe", q_f32, s_k_per_q).contiguous()
 
     if mse_bits > 0:
         if pi_k_per_q is None:
             Pi_k = key_quantizer.mse.rotation.Pi.to(device=device, dtype=torch.float32)
             pi_k_per_q = Pi_k.index_select(0, kv_for_q).contiguous()
-        Q_rot = torch.einsum("bhd,hed->bhe", q_f32, pi_k_per_q).contiguous()
     else:
-        Q_rot = torch.zeros_like(Q_qjl)
+        # Kernel still needs a valid pointer even when MSE_BITS=0; it just
+        # won't read from it (the branch returns a zero register tile). Use
+        # a per-(device,shape) cached dummy so we don't allocate 64 KB every
+        # call on the eager path.
+        pi_k_per_q = _dummy_pi_k(device, H_q, D)
+
+    if pi_v_per_q is None:
+        Pi_v = value_quantizer.rotation.Pi.to(device=device, dtype=torch.float32)
+        pi_v_per_q = Pi_v.index_select(0, kv_for_q).contiguous()
 
     # --- Gather packed tensors --------------------------------------------
-    # The Triton kernel requires fp32 for gamma / norms_k / norms_v. We
-    # *intentionally* do not pin fp32 at store time — the quantizer currently
-    # emits fp32, so `.to(torch.float32)` below is a zero-copy no-op in the
-    # common case, while leaving room for a future memory-saving narrower
-    # storage dtype without touching this wrapper.
+    # gamma / norms are fp16 in storage (Phase A); kernel upcasts per-element
+    # via `tl.load(...).to(tl.float32)` so no whole-buffer cast here.
     qjl_packed = key_store.qjl_packed.contiguous()
-    gamma = key_store.gamma.contiguous().to(torch.float32)
-    norms_k = key_store.norms.contiguous().to(torch.float32)
+    gamma = key_store.gamma.contiguous()
+    norms_k = key_store.norms.contiguous()
     if key_store.mse_packed is not None:
         mse_packed = key_store.mse_packed.contiguous()
     else:
         mse_packed = torch.zeros(1, dtype=torch.uint8, device=device)
 
     val_idx_packed = value_store.idx_packed.contiguous()
-    norms_v = value_store.norms.contiguous().to(torch.float32)
+    norms_v = value_store.norms.contiguous()
 
     if key_cent_lut is None:
         key_cent_lut = _key_centroid_lut(key_quantizer).to(device).contiguous()
@@ -405,12 +448,12 @@ def fused_decompress_attention_triton(
         partials_acc = scratch.partials_acc
         partials_m = scratch.partials_m
         partials_l = scratch.partials_l
-        out_rot = scratch.out_rot
+        out = scratch.out
     else:
         partials_acc = torch.empty(B, H_q, num_splits, D, dtype=torch.float32, device=device)
         partials_m = torch.empty(B, H_q, num_splits, dtype=torch.float32, device=device)
         partials_l = torch.empty(B, H_q, num_splits, dtype=torch.float32, device=device)
-        out_rot = torch.empty(B, H_q, D, dtype=torch.float32, device=device)
+        out = torch.empty(B, H_q, D, dtype=torch.float32, device=device)
 
     if s_total_tensor is None:
         s_total_tensor = torch.tensor(S_total, dtype=torch.int32, device=device)
@@ -418,7 +461,10 @@ def fused_decompress_attention_triton(
     def st(t: torch.Tensor) -> list[int]:
         return list(t.stride())
 
-    sqrot = st(q_f32)                         # [B,H_q,D]
+    sqd = st(q_3d)                            # [B,H_q,D]
+    ssk = st(s_k_per_q)                       # [H_q,D,D]
+    spi = st(pi_k_per_q)                      # [H_q,D,D]
+    spv = st(pi_v_per_q)                      # [H_q,D,D]
     sqjlp = st(qjl_packed)
     smsep = st(mse_packed) if mse_packed.dim() == 4 else [0, 0, 0, 0]
     sg = st(gamma)
@@ -427,18 +473,20 @@ def fused_decompress_attention_triton(
     snv = st(norms_v)
     spa = st(partials_acc)                    # [B,H_q,NS,D]
     spm = st(partials_m)                      # [B,H_q,NS]
-    sor = st(out_rot)                         # [B,H_q,D]
+    sor = st(out)                             # [B,H_q,D] canonical V-space
 
     S_bucket = _s_bucket(S_total)
     grid_split = (B, H_q, num_splits)
     _attn_split_kernel[grid_split](
-        Q_rot, Q_qjl,
+        q_3d, s_k_per_q, pi_k_per_q,
         qjl_packed, mse_packed,
         gamma, norms_k,
         val_idx_packed, norms_v,
         key_cent_lut, val_cent_lut,
         partials_acc, partials_m, partials_l,
-        sqrot[0], sqrot[1],
+        sqd[0], sqd[1],
+        ssk[0], ssk[1],
+        spi[0], spi[1],
         spa[0], spa[1], spa[2],
         spm[0], spm[1],
         sqjlp[0], sqjlp[1], sqjlp[2],
@@ -463,19 +511,15 @@ def fused_decompress_attention_triton(
     grid_reduce = (B, H_q)
     _attn_reduce_kernel[grid_reduce](
         partials_acc, partials_m, partials_l,
-        out_rot,
+        pi_v_per_q,
+        out,
         spa[0], spa[1], spa[2],
         spm[0], spm[1],
+        spv[0], spv[1],
         sor[0], sor[1],
         num_splits,
         D=D,
         BLOCK_SPLITS=block_splits,
     )
-
-    # --- Apply Pi_v once (rotated → canonical V-space) --------------------
-    if pi_v_per_q is None:
-        Pi_v = value_quantizer.rotation.Pi.to(device=device, dtype=torch.float32)
-        pi_v_per_q = Pi_v.index_select(0, kv_for_q).contiguous()
-    out = torch.einsum("bhd,hde->bhe", out_rot, pi_v_per_q)
 
     return out.unsqueeze(2).to(in_dtype)

@@ -122,11 +122,13 @@ class _BatchedKeyStore:
             dtype=torch.uint8,
             device=device,
         )
+        # fp16 storage (Phase A): scalars per position, kernel upcasts on load.
+        # Saves ~6 B/position/head of metadata vs fp32.
         self.gamma = torch.empty(
-            (H, B, max_seq_len), dtype=torch.float32, device=device
+            (H, B, max_seq_len), dtype=torch.float16, device=device
         )
         self.norms = torch.empty(
-            (H, B, max_seq_len), dtype=torch.float32, device=device
+            (H, B, max_seq_len), dtype=torch.float16, device=device
         )
         mse_bits = self.key_bits - 1
         if mse_bits > 0:
@@ -193,14 +195,12 @@ class _BatchedKeyStore:
         qjl_4d = q_dict["qjl"].reshape(H, B, S_new, D)
         self.qjl_packed = _cat_or_init(self.qjl_packed, pack_signs(qjl_4d), dim=2)
 
-        # gamma: [H, B*S_new] → [H, B, S_new]. Dtype follows the quantizer
-        # output (currently fp32); kernels that need fp32 should cast lazily
-        # so storage can be narrowed later for memory savings.
-        gamma_3d = q_dict["gamma"].reshape(H, B, S_new)
+        # gamma/norms: narrow to fp16 at store time (Phase A). Kernel upcasts
+        # on load; fp16 precision is ample for a per-position scalar.
+        gamma_3d = q_dict["gamma"].reshape(H, B, S_new).to(torch.float16)
         self.gamma = _cat_or_init(self.gamma, gamma_3d, dim=2)
 
-        # norms: [H, B*S_new] → [H, B, S_new]. See gamma above for dtype policy.
-        norms_3d = norms_in.reshape(H, B, S_new)
+        norms_3d = norms_in.reshape(H, B, S_new).to(torch.float16)
         self.norms = _cat_or_init(self.norms, norms_3d, dim=2)
 
         # mse indices: [H, B*S_new, D] → pack at (key_bits-1) bits
@@ -358,7 +358,7 @@ class _BatchedValueStore:
             device=device,
         )
         self.norms = torch.empty(
-            (H, B, max_seq_len), dtype=torch.float32, device=device
+            (H, B, max_seq_len), dtype=torch.float16, device=device
         )
         self._slab_active = True
         self._overflow_warned = False
@@ -409,7 +409,7 @@ class _BatchedValueStore:
             self.idx_packed, pack_bits(idx_4d, n_bits=self.value_bits), dim=2
         )
 
-        norms_3d = norms_in.reshape(H, B, S_new)
+        norms_3d = norms_in.reshape(H, B, S_new).to(torch.float16)
         self.norms = _cat_or_init(self.norms, norms_3d, dim=2)
 
     def _append_slab(
@@ -697,7 +697,7 @@ class TurboQuantCacheLayer(CacheLayerMixin):
                 B, H_q, max_num_splits_any_bucket,
                 dtype=torch.float32, device=device,
             ),
-            out_rot=torch.empty(
+            out=torch.empty(
                 B, H_q, D, dtype=torch.float32, device=device,
             ),
             num_splits_max=max_num_splits_any_bucket,
@@ -733,7 +733,7 @@ class TurboQuantCacheLayer(CacheLayerMixin):
             partials_acc=self._shared_scratch.partials_acc,
             partials_m=self._shared_scratch.partials_m,
             partials_l=self._shared_scratch.partials_l,
-            out_rot=self._shared_scratch.out_rot,
+            out=self._shared_scratch.out,
             num_splits_max=num_splits_max,
             split_size=split_size,
         )

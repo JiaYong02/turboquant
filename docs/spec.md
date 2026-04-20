@@ -30,15 +30,24 @@ in a production-ready llama.cpp fork with native GGML quantization types.
 | 6 | Distortion bounds & packaging | Done | test_distortion_bounds.py, README, __init__ |
 | 7 | PyTorch backend | Done | Port all modules to torch with GPU support |
 | 8 | KV cache integration | Done | Architecture-agnostic HuggingFace cache hook |
-| 9 | Evaluation suite | Planned | LongBench + perplexity benchmarks |
-| 10 | llama.cpp fork | Planned | Native GGML_TYPE_TQ{b} quantization types |
-| 11+ | Production hardening | Planned | Performance, outlier channels, CI/CD, docs |
+| 9 | Fused decompress+attention Triton kernel | Done | Single-kernel decode, compressed-KV read |
+| 10 | FlashDecoding split-KV | Done | Split-K parallelism, folded-rotation trick |
+| 11a | Cached per-Q-head rotations | Done | Eliminate per-call index_select + fp32 cast |
+| 11b | CUDA-graph capture | Done | Slab KV, device-scalar S_total, captured decode |
+| 12 | Rotation fusion + persistent kernel | Planned | Close gap to FP16 SDPA tok/s (Phase 9 DoD) |
+| 13 | Evaluation suite | Planned | LongBench + perplexity benchmarks |
+| 14 | llama.cpp fork | Planned | Native GGML_TYPE_TQ{b} quantization types |
+| 15+ | Production hardening | Planned | Outlier channels, CI/CD, docs, H100/FP8 |
 
 ### Dependency Graph
 
 ```
-Phase 7 (PyTorch) --> Phase 8 (KV Cache) --> Phase 9 (Eval) --> Phase 11+ (Hardening)
-                                         \-> Phase 10 (llama.cpp, parallel with 9)
+Phase 7 (PyTorch) --> Phase 8 (KV Cache) --> Phase 9 (Fused kernel) --> Phase 10 (Split-KV)
+                                                                   \-> Phase 11a (Cached rotations)
+                                                                   \-> Phase 11b (CUDA graph)
+                                                                   \-> Phase 12 (Rotation fusion) --> Phase 13 (Eval)
+                                                                                                  \-> Phase 14 (llama.cpp)
+                                                                                                  \-> Phase 15+ (Hardening)
 ```
 
 ---
@@ -464,7 +473,215 @@ For RTX 5000 Ada (16 GB/s HBM bandwidth):
 
 ---
 
-## Phase 10: Evaluation Suite
+## Phase 10: FlashDecoding Split-KV (done)
+
+### Goal
+
+Extend the Phase 9 fused kernel with FlashDecoding v2 split-K parallelism so
+decode saturates the GPU when `B * H_q` is smaller than the SM count.
+
+### What Landed
+
+- `_attn_split_kernel` — grid `(B, H_q, NUM_SPLITS)`, streaming softmax over
+  `SPLIT_SIZE`-wide KV tiles; per-tile centroid gather + QJL sign reconstruct
+  inline.
+- `_attn_reduce_kernel` — grid `(B, H_q)`, merges `NUM_SPLITS` streaming-softmax
+  states into a single canonical-V output via log-sum-exp.
+- `_pick_split_size` — auto-tunes `SPLIT_SIZE` so grid covers ≥ 2× SM count at
+  the target decode shape (132 SMs on H100).
+- Folded-rotation trick — `S_k`, `Pi_k`, `Pi_v` per-Q-head matrices applied
+  once via `torch.einsum` before the kernel; kernel consumes pre-rotated `Q_qjl`
+  and `Q_rot`.
+
+### Tests
+
+`tests/test_decompress_attn_triton.py` — 15 parity tests across bit-widths
+(b ∈ {2, 3, 4, 5}), shapes (B, H_q, H_kv, S, D), and GQA ratios.
+
+### Outcome
+
+Fused kernel becomes correctness-complete and auto-tuned across shapes. Decode
+latency at B=1, H_q=32, S=1024, b=4 on H100 sits at ~221 μs eager — dominated
+by CPU dispatch, not GPU work. Phase 11 addresses that.
+
+---
+
+## Phase 11a: Cached Per-Q-Head Rotations (done)
+
+### Goal
+
+Hoist the per-Q-head rotation cache (`S_k_per_q`, `Pi_k_per_q`, `Pi_v_per_q`)
+out of the per-call hot path — these matrices are invariant for a cache layer's
+lifetime.
+
+### What Landed
+
+- `TurboQuantCacheLayer._prepare_fused_state()` computes `kv_for_q`, per-Q-head
+  `S_k_per_q`, `Pi_k_per_q`, `Pi_v_per_q`, and centroid LUTs (`_key_cent_lut`,
+  `_val_cent_lut`) once on first decode; stores them on the layer.
+- `fused_decompress_attention_triton` accepts these as optional kwargs and
+  skips the cold `index_select(...).to(fp32).contiguous()` path when provided.
+
+### Outcome
+
+Eager fused path drops from ~450 μs to ~221 μs on the Phase 9 DoD shape. CPU
+dispatch still dominates (~180 μs of the 221 μs — 3 einsum→bmm dispatches, 1
+`q.to(fp32)` copy, 5 scratch allocations, 2 Triton launches, 1 output einsum).
+
+---
+
+## Phase 11b: CUDA-Graph Capture (done)
+
+### Goal
+
+Absorb the ~180 μs of CPU dispatch overhead that dominates eager decode, by
+capturing the fused decode subgraph once per power-of-2 `S` bucket and
+replaying on every step.
+
+### What Landed
+
+- **Pre-allocated KV slabs** on `_BatchedKeyStore` and `_BatchedValueStore`:
+  `preallocate(max_seq_len, B)` replaces growing `cat` buffers with fixed
+  slabs; `append()` writes into `[:, :, seq_len:seq_len+S_new, :]` and
+  advances `_seq_len`. Keeps tensor data pointers stable across steps
+  (the blocker for naïve graph capture).
+- **Device-scalar `S_total`** in `_attn_split_kernel` and `_attn_reduce_kernel`
+  — passed as a 0-d int32 tensor and loaded via `tl.load(s_total_ptr)`, so a
+  single capture serves every `seq_len` within a bucket.
+- **`_fused_graph_forward`** driver on `TurboQuantCacheLayer`:
+  warmup-on-miss, capture under a shared
+  `torch.cuda.graph_pool_handle()`, replay = 1 D2D copy
+  (`q_static.copy_(q)`) + `graph.replay()`.
+- **Bucketed capture cache** — one `_CapturedGraph` per
+  `_s_bucket(seq_len) ∈ {256, 1024, 4096, 16384, 65536}` (≤ 6 captures per
+  layer for `max_seq_len=65536`).
+- **Invalidation** on `reset` / `crop` / `reorder_cache` — captures are
+  dropped; re-capture on next decode is a one-shot ~200 μs cost.
+- **HF attention routing** (`integrations/attention.py`): eligible decode
+  steps (`S_q == 1`, fused kernel on, slab preallocated, no autograd, CUDA)
+  route through `_fused_graph_forward`; everything else falls back to the
+  eager fused path or SDPA.
+
+### Files
+
+| File | Change |
+|------|--------|
+| `src/turboquant/integrations/hf_cache.py` | Slab KV stores, `_fused_graph_forward`, `max_seq_len` / `use_cuda_graph` options, invalidation hooks |
+| `src/turboquant/kernels/decompress_attn.py` | Device-scalar `S_total`, optional `scratch`/`s_total_tensor` passthrough |
+| `src/turboquant/integrations/attention.py` | Route eligible decode to graph driver |
+| `tests/test_fused_kernel_cuda_graph.py` (new) | Parity vs eager, bucket transitions, invalidation, determinism |
+| `tests/test_fused_kernel_perf.py` | Graph perf gate (≤ 3.0× SDPA for regression detection) |
+| `scripts/benchmark_fused_kernel.py` | `--cuda-graph` flag |
+
+### Outcome (H100, B=1, H_q=32, H_kv=8, S=1024, D=128, b=4)
+
+| Path | Latency | vs SDPA |
+|------|---------|---------|
+| FP16 SDPA (cuDNN) | 17.3 μs | 1.00× |
+| Fused eager (pre-11b) | ~221 μs | 12.87× |
+| **Fused + CUDA graph** | **40.5 μs** | **2.34×** |
+
+5.3× eager speedup. CPU dispatch absorbed as designed. The residual 23 μs is
+GPU-side: Triton kernel-launch latency + three rotation dispatches still live
+on the PyTorch side of the captured graph. Phase 12 addresses those to close
+Phase 9 DoD.
+
+### Definition of Done
+
+- 351 parity tests green (incl. 7 new graph-path tests).
+- `TURBOQUANT_PERF=1 TURBOQUANT_CUDA_GRAPH=1` graph gate passes at ≤ 3.0×.
+- `model.generate(..., past_key_values=TurboQuantCache(..., use_fused_kernel=True, max_seq_len=4096, use_cuda_graph=True))` runs end-to-end.
+
+---
+
+## Phase 12: Rotation Fusion + Persistent Kernel (planned)
+
+### Goal
+
+Close the 23 μs gap between captured-graph fused decode (40.5 μs) and FP16
+SDPA (17.3 μs), meeting the Phase 9 DoD (fused decode ≥ FP16 SDPA tok/s at
+S=1024, b=4).
+
+### Where the Residual Lives
+
+Inside the captured graph today, per decode step:
+
+| Op | File:Line | Est. cost |
+|----|-----------|-----------|
+| `q_f32 = q.to(fp32).squeeze(2).contiguous()` | `decompress_attn.py:351` | ~2 μs |
+| `Q_qjl = einsum("bhd,hed->bhe", q_f32, s_k_per_q)` | `decompress_attn.py:361` | ~2 μs |
+| `Q_rot = einsum("bhd,hed->bhe", q_f32, pi_k_per_q)` | `decompress_attn.py:367` | ~2 μs |
+| `_attn_split_kernel` launch | `decompress_attn.py:434` | ~3 μs launch + ~15 μs work |
+| `_attn_reduce_kernel` launch | `decompress_attn.py:464` | ~3 μs launch + ~3 μs work |
+| `out = einsum("bhd,hde->bhe", out_rot, pi_v_per_q)` | `decompress_attn.py:479` | ~2 μs |
+| `.unsqueeze(2).to(in_dtype)` | `decompress_attn.py:481` | ~1 μs |
+
+### Design (three additive changes)
+
+**A. Fuse Q-side rotations into `_attn_split_kernel`.** Move `q @ S_k` and
+`q @ Pi_k` mat-vecs from `torch.einsum` into the kernel entry. Each program
+instance loads `q[b, h_q, :D]` and `S_k[h_q]` / `Pi_k[h_q]` into registers
+once, computes the two `1×D · D×D` products (~33 k FMAs at D=128), and uses
+the register values in place of the old `Q_rot_ptr` / `Q_qjl_ptr` loads.
+Recomputing across `NUM_SPLITS` blocks (< 8) is < 1 μs, so no cross-block
+sync is needed. **Saves ~5–6 μs.**
+
+**B. Fuse Pi_v output rotation into `_attn_reduce_kernel`.** After the
+streaming-softmax merge computes `acc_star[:D]`, apply `Pi_v[h_q]` in-register
+before the divide-by-`l_star` and store directly in `in_dtype` (fp16/bf16/
+fp32). Eliminates the trailing `torch.einsum` and the dtype cast. **Saves
+~3 μs.** Gate fused path by `D ≤ 128` (covers current decode shape; fail
+loud above).
+
+**C. Persistent-kernel merge of split + reduce (stretch).** Collapse split
+into reduce by making reduce the outer loop — a single grid-`(B, H_q)`
+kernel that tiles over the whole KV range in `BLOCK_N` chunks with streaming
+softmax, no inter-block sync. Sacrifices the `NUM_SPLITS` parallelism
+(already underused at B=1, H_q=32) but removes one full kernel launch.
+**Saves ~3 μs.** Needed to hit DoD.
+
+### Projected Landing
+
+| Stage | Latency | vs SDPA |
+|-------|---------|---------|
+| Today (post-11b) | 40.5 μs | 2.34× |
+| A + B | ~28 μs | ~1.6× |
+| A + B + C | **~22 μs** | **~1.3×** |
+
+### Files
+
+| File | Change |
+|------|--------|
+| `src/turboquant/kernels/decompress_attn.py` | Fused-rotation kernel bodies (A, B); optional persistent kernel (C) |
+| `src/turboquant/integrations/hf_cache.py` | Pass cached rotations through existing `FusedAttnScratch` pathway (no structural change) |
+| `tests/test_fused_kernel_rotation_fusion.py` (new) | Parity: fused vs unfused reference at fp32 (bit-identical) and fp16 (atol=1e-3) across shape sweep |
+| `tests/test_fused_kernel_perf.py` | Tighten eager gate to ≤ 1.5×, graph gate to ≤ 1.3× (or ≤ 1.6× if only A+B land) |
+
+### Risks
+
+- **Tensor-core rounding drift** from register mat-vecs vs cuBLAS — absorbed
+  by fp16 atol=1e-3 parity tests; fp32 path is bit-identical.
+- **Reduce-kernel register pressure** from the D×D Pi_v load (64 KB fp32 at
+  D=128) — tile via `BLOCK_D` when needed; gate by `D ≤ 128`.
+- **Triton autotune thrash** from new constexprs — pin via `triton.autotune`
+  key `(D, MSE_BITS, VAL_BITS, SPLIT_SIZE, OUT_DTYPE)`.
+- **C hits a Triton gotcha** — the "collapse split into reduce" formulation
+  avoids the missing grid-wide barrier. If tile math doesn't work cleanly,
+  stop at A+B (~1.6× SDPA) and file a follow-up; C is the DoD-critical step.
+
+### Definition of Done
+
+- New parity suite + existing 15 + 7 graph tests green.
+- `TURBOQUANT_PERF=1 TURBOQUANT_CUDA_GRAPH=1` graph gate passes at ≤ 1.3×.
+- `scripts/benchmark_fused_kernel.py --seq 1024 --bits 4 --cuda-graph` shows
+  fused+graph ≤ 22 μs at the Phase 9 DoD shape.
+- `model.generate()` on Llama-3.1-8B with `TurboQuantCache(..., use_fused_kernel=True, use_cuda_graph=True)` achieves tok/s ≥ FP16 SDPA baseline.
+- `torch.profiler` trace: one `cudaGraphLaunch` per decode step containing
+  one Triton kernel (post-C); zero `aten::einsum` on the hot path.
+
+---
+
+## Phase 13: Evaluation Suite
 
 ### Goal
 
@@ -561,7 +778,7 @@ Metrics: F1 (QA), ROUGE-L (summarization), accuracy (classification).
 
 ---
 
-## Phase 11: llama.cpp Fork
+## Phase 14: llama.cpp Fork
 
 ### Goal
 
@@ -660,9 +877,9 @@ llama-cli -m model.gguf \
 
 ---
 
-## Phase 12+: Production Hardening
+## Phase 15+: Production Hardening
 
-### 12a: Performance Optimization
+### 15a: Performance Optimization
 
 - Profile the dequantization hotpath (likely the d x d matmul for unrotation).
 - Investigate randomized Hadamard transform as O(d log d) alternative to
@@ -671,7 +888,7 @@ llama-cli -m model.gguf \
 - Explore incremental attention: compute attention scores directly from
   compressed representation without full dequantization.
 
-### 12b: Outlier Channel Strategy
+### 15b: Outlier Channel Strategy
 
 - Implement the paper's 2.5-bit and 3.5-bit configurations.
 - Per-layer outlier detection based on activation magnitude statistics.
@@ -679,25 +896,25 @@ llama-cli -m model.gguf \
 - This requires a lightweight calibration pass (small departure from the
   fully data-oblivious design, but consistent with the paper's approach).
 
-### 12c: Documentation
+### 15c: Documentation
 
 - Jupyter notebook demonstrating KV cache compression on Llama-3.1-8B.
 - API reference documentation (Sphinx or MkDocs).
 - Performance comparison charts (distortion vs bit-width, throughput vs
   sequence length).
 
-### 12d: CI/CD Pipeline
+### 15d: CI/CD Pipeline
 
 - GitHub Actions on push: pytest, ruff lint, mypy type check.
 - GPU tests on a self-hosted runner or triggered manually.
 - Benchmark regression tracking (flag if perplexity degrades > 0.5%).
 
-### 12e: Distribution
+### 15e: Distribution
 
 - PyPI package publication (once API is stable).
 - HuggingFace model cards showing TurboQuant benchmark results.
 
-### 12f: H100 / FP8 Support
+### 15f: H100 / FP8 Support
 
 Target hardware: NVIDIA H100 (SM 90) with native FP8 tensor cores.
 
