@@ -34,10 +34,12 @@ in a production-ready llama.cpp fork with native GGML quantization types.
 | 10 | FlashDecoding split-KV | Done | Split-K parallelism, folded-rotation trick |
 | 11a | Cached per-Q-head rotations | Done | Eliminate per-call index_select + fp32 cast |
 | 11b | CUDA-graph capture | Done | Slab KV, device-scalar S_total, captured decode |
-| 12 | Rotation fusion + persistent kernel | Planned | Close gap to FP16 SDPA tok/s (Phase 9 DoD) |
-| 13 | Evaluation suite | Planned | LongBench + perplexity benchmarks |
-| 14 | llama.cpp fork | Planned | Native GGML_TYPE_TQ{b} quantization types |
-| 15+ | Production hardening | Planned | Outlier channels, CI/CD, docs, H100/FP8 |
+| 12 | Rotation fusion (A/B) + fp16 norms (Phase A) | Done | Fused Q/Pi_v rotations, fp16 gamma/norms. Speed DoD parked as future work |
+| 13 | Bit-tight packing | Planned | Byte-crossing packer for odd bit widths (3/5/6); unlocks paper-level compression |
+| 14 | Outlier-channel split | Planned | Fractional avg bit-widths (2.5/3.5) via per-head outlier perm + two buckets |
+| 15 | Evaluation suite | Planned | LongBench + perplexity benchmarks |
+| 16 | llama.cpp fork | Planned | Native GGML_TYPE_TQ{b} quantization types |
+| 17+ | Production hardening | Planned | CI/CD, docs, H100/FP8 |
 
 ### Dependency Graph
 
@@ -45,9 +47,11 @@ in a production-ready llama.cpp fork with native GGML quantization types.
 Phase 7 (PyTorch) --> Phase 8 (KV Cache) --> Phase 9 (Fused kernel) --> Phase 10 (Split-KV)
                                                                    \-> Phase 11a (Cached rotations)
                                                                    \-> Phase 11b (CUDA graph)
-                                                                   \-> Phase 12 (Rotation fusion) --> Phase 13 (Eval)
-                                                                                                  \-> Phase 14 (llama.cpp)
-                                                                                                  \-> Phase 15+ (Hardening)
+                                                                   \-> Phase 12 (Rotation fusion) --> Phase 13 (Bit-tight packing)
+                                                                                                  \-> Phase 14 (Outlier-channel split)
+                                                                                                  \-> Phase 15 (Eval)
+                                                                                                  \-> Phase 16 (llama.cpp)
+                                                                                                  \-> Phase 17+ (Hardening)
 ```
 
 ---
@@ -594,7 +598,7 @@ Phase 9 DoD.
 
 ---
 
-## Phase 12: Rotation Fusion + Persistent Kernel (planned)
+## Phase 12: Rotation Fusion + fp16 Norms (done, speed DoD parked)
 
 ### Goal
 
@@ -602,86 +606,143 @@ Close the 23 μs gap between captured-graph fused decode (40.5 μs) and FP16
 SDPA (17.3 μs), meeting the Phase 9 DoD (fused decode ≥ FP16 SDPA tok/s at
 S=1024, b=4).
 
-### Where the Residual Lives
+### What Landed (commit `72ea573`)
 
-Inside the captured graph today, per decode step:
+- **12A (Q-side rotation fusion):** `q @ S_k` and `q @ Pi_k` mat-vecs moved
+  into `_attn_split_kernel`. Eliminates the `q.to(fp32)` cast and two
+  cuBLAS einsum launches.
+- **12B (V-side rotation fusion):** `Pi_v` mat-vec moved into
+  `_attn_reduce_kernel`; output written directly in canonical V-space at
+  `in_dtype`. Eliminates the trailing einsum and dtype cast.
+- **Phase A (fp16 norms):** `gamma` and K/V `norms` narrowed from fp32 to
+  fp16 at storage time; kernel upcasts on load. Saves ~6 B/token of
+  metadata.
+- **Phase 12C (persistent kernel) skipped.** Profile revealed
+  `_attn_split_kernel` alone is 23.9 μs (dequant-traffic bound), exceeding
+  the 22 μs DoD target even if reduce were free. Residual gap is
+  compute-bound (fp32 ALU) vs SDPA tensor cores. Merging reduce would save
+  only ~3 μs.
 
-| Op | File:Line | Est. cost |
-|----|-----------|-----------|
-| `q_f32 = q.to(fp32).squeeze(2).contiguous()` | `decompress_attn.py:351` | ~2 μs |
-| `Q_qjl = einsum("bhd,hed->bhe", q_f32, s_k_per_q)` | `decompress_attn.py:361` | ~2 μs |
-| `Q_rot = einsum("bhd,hed->bhe", q_f32, pi_k_per_q)` | `decompress_attn.py:367` | ~2 μs |
-| `_attn_split_kernel` launch | `decompress_attn.py:434` | ~3 μs launch + ~15 μs work |
-| `_attn_reduce_kernel` launch | `decompress_attn.py:464` | ~3 μs launch + ~3 μs work |
-| `out = einsum("bhd,hde->bhe", out_rot, pi_v_per_q)` | `decompress_attn.py:479` | ~2 μs |
-| `.unsqueeze(2).to(in_dtype)` | `decompress_attn.py:481` | ~1 μs |
+### Outcome
 
-### Design (three additive changes)
+| Path | Latency | vs SDPA |
+|------|---------|---------|
+| FP16 SDPA (cuDNN) | 17.3 μs | 1.00× |
+| Fused + CUDA graph (pre-12) | 40.5 μs | 2.34× |
+| **Fused + graph + 12A + 12B** | **37 μs** | **2.14×** |
 
-**A. Fuse Q-side rotations into `_attn_split_kernel`.** Move `q @ S_k` and
-`q @ Pi_k` mat-vecs from `torch.einsum` into the kernel entry. Each program
-instance loads `q[b, h_q, :D]` and `S_k[h_q]` / `Pi_k[h_q]` into registers
-once, computes the two `1×D · D×D` products (~33 k FMAs at D=128), and uses
-the register values in place of the old `Q_rot_ptr` / `Q_qjl_ptr` loads.
-Recomputing across `NUM_SPLITS` blocks (< 8) is < 1 μs, so no cross-block
-sync is needed. **Saves ~5–6 μs.**
+**Speed DoD (Phase 9) parked as future work.** Closing it requires tensor-
+core utilisation inside the dequant path; revisit when integrating into
+vLLM/SGLang where a production kernel stack is in play. Memory thesis
+(Phase 13 + 14) is the current priority.
 
-**B. Fuse Pi_v output rotation into `_attn_reduce_kernel`.** After the
-streaming-softmax merge computes `acc_star[:D]`, apply `Pi_v[h_q]` in-register
-before the divide-by-`l_star` and store directly in `in_dtype` (fp16/bf16/
-fp32). Eliminates the trailing `torch.einsum` and the dtype cast. **Saves
-~3 μs.** Gate fused path by `D ≤ 128` (covers current decode shape; fail
-loud above).
+## Phase 13: Bit-tight Packing (planned)
 
-**C. Persistent-kernel merge of split + reduce (stretch).** Collapse split
-into reduce by making reduce the outer loop — a single grid-`(B, H_q)`
-kernel that tiles over the whole KV range in `BLOCK_N` chunks with streaming
-softmax, no inter-block sync. Sacrifices the `NUM_SPLITS` parallelism
-(already underused at B=1, H_q=32) but removes one full kernel launch.
-**Saves ~3 μs.** Needed to hit DoD.
+### Goal
 
-### Projected Landing
+Close the remaining 16 B/token gap between our measured per-token storage
+(150 B at b=4, D=128) and the TurboQuant paper's spec (134 B = **3.82× vs
+FP16**). The gap is not a spec bug — `mse_packed` correctly stores `b-1 =
+3` bits per coord — but `pack_bits(n_bits=3)` lays values at `vpb = 8 // 3
+= 2` values per byte, wasting 25% (2 bits per byte) at odd widths.
 
-| Stage | Latency | vs SDPA |
-|-------|---------|---------|
-| Today (post-11b) | 40.5 μs | 2.34× |
-| A + B | ~28 μs | ~1.6× |
-| A + B + C | **~22 μs** | **~1.3×** |
+This phase also unlocks Phase 14: outlier-channel split at `b+1 = 5` bits
+is otherwise packed at `vpb=1` (3 wasted bits/byte, 37.5% overhead), which
+would erase Phase 14's compression gains.
+
+### Design
+
+Replace the `vpb`-based byte-aligned packer with a **bit-cursor packer**
+that lays values end-to-end across bytes. Widths supported: `n_bits ∈
+{1, 2, 3, 4, 5, 6}`. Power-of-two widths stay unchanged (already tight).
+
+**Storage layout:**
+- `packed_bytes = ceil(D * n_bits / 8)`
+- Value at index `i` occupies global bit offset `i * n_bits`, MSB-first
+  within the stream. A single value may span two adjacent bytes.
+
+**Kernel unpack:** precompute per-coord `(byte_lo, byte_hi, shift, mask)`
+vectors of length `D`; the inner load path becomes `(byte_lo << 8 |
+byte_hi) >> shift) & mask`. Power-of-two widths short-circuit to a single-
+byte load when `d_off * n_bits % 8 == 0`.
 
 ### Files
 
 | File | Change |
 |------|--------|
-| `src/turboquant/kernels/decompress_attn.py` | Fused-rotation kernel bodies (A, B); optional persistent kernel (C) |
-| `src/turboquant/integrations/hf_cache.py` | Pass cached rotations through existing `FusedAttnScratch` pathway (no structural change) |
-| `tests/test_fused_kernel_rotation_fusion.py` (new) | Parity: fused vs unfused reference at fp32 (bit-identical) and fp16 (atol=1e-3) across shape sweep |
-| `tests/test_fused_kernel_perf.py` | Tighten eager gate to ≤ 1.5×, graph gate to ≤ 1.3× (or ≤ 1.6× if only A+B land) |
-
-### Risks
-
-- **Tensor-core rounding drift** from register mat-vecs vs cuBLAS — absorbed
-  by fp16 atol=1e-3 parity tests; fp32 path is bit-identical.
-- **Reduce-kernel register pressure** from the D×D Pi_v load (64 KB fp32 at
-  D=128) — tile via `BLOCK_D` when needed; gate by `D ≤ 128`.
-- **Triton autotune thrash** from new constexprs — pin via `triton.autotune`
-  key `(D, MSE_BITS, VAL_BITS, SPLIT_SIZE, OUT_DTYPE)`.
-- **C hits a Triton gotcha** — the "collapse split into reduce" formulation
-  avoids the missing grid-wide barrier. If tile math doesn't work cleanly,
-  stop at A+B (~1.6× SDPA) and file a follow-up; C is the DoD-critical step.
+| `src/turboquant/bit_packing.py` | Rewrite `pack_bits` / `unpack_bits` to bit-cursor layout; signatures unchanged |
+| `src/turboquant/kernels/decompress_attn.py` | Replace single-byte MSE / V-idx unpack with two-byte-load spanning logic |
+| `tests/test_bit_packing.py` | Extend round-trip sweeps to `n_bits ∈ {3, 5, 6}` at `D ∈ {64, 96, 128, 192}` |
+| `tests/test_decompress_attn_triton.py` | Existing 15 parity tests re-run; add `key_bits=5` / `value_bits=5` sweep |
+| `scripts/measure_compression.py` (new) | Print per-component bytes/token + ratio |
 
 ### Definition of Done
 
-- New parity suite + existing 15 + 7 graph tests green.
-- `TURBOQUANT_PERF=1 TURBOQUANT_CUDA_GRAPH=1` graph gate passes at ≤ 1.3×.
-- `scripts/benchmark_fused_kernel.py --seq 1024 --bits 4 --cuda-graph` shows
-  fused+graph ≤ 22 μs at the Phase 9 DoD shape.
-- `model.generate()` on Llama-3.1-8B with `TurboQuantCache(..., use_fused_kernel=True, use_cuda_graph=True)` achieves tok/s ≥ FP16 SDPA baseline.
-- `torch.profiler` trace: one `cudaGraphLaunch` per decode step containing
-  one Triton kernel (post-C); zero `aten::einsum` on the hot path.
+- All parity tests green including new odd-width sweeps.
+- `scripts/measure_compression.py --bits 4` emits 134 B/token, 3.82× ratio.
+- Graph perf gate (`TURBOQUANT_CUDA_GRAPH=1`) still ≤ 2.4× SDPA.
+
+## Phase 14: Outlier-Channel Split (planned)
+
+### Goal
+
+Reach fractional average bit-widths (2.5, 3.5) by splitting D channels
+into **outliers** (high-magnitude, stored at `b+1` bits) and **regulars**
+(low-magnitude, stored at `b-1` bits). Matches the paper's Section 4.2 /
+LLM.int8 [Dettmers et al.] outlier strategy.
+
+### Design
+
+**Storage model** (average `b` bits, outlier fraction `f`):
+
+- `n_out = round(f * D)` outlier channels → `b_hi = b+1` bits
+- `n_reg = D - n_out` regular channels → `b_lo = b-1` bits
+- Average: `f*(b+1) + (1-f)*(b-1) = b - 1 + 2f` bits/coord.
+  - `f=0.25, b=3` → avg 2.5
+  - `f=0.25, b=4` → avg 3.5
+  - `f=0.5,  b=b` → avg b (breakeven, useful for validation)
+
+**Per-head static permutation** places outliers in `[0..n_out)` of the
+rotated D-axis. Fold permutation into `Pi_effective = Pi[perm]` so the
+kernel sees a single rotation and the outlier prefix is natural.
+
+**Offline calibration** (one-time): for each head, compute per-channel RMS
+of rotated `Π·x` on a calibration batch; top-`n_out` by magnitude →
+outliers. Persisted as `_outlier_perm: LongTensor[H, D]` on the quantizer.
+
+### Files
+
+| File | Change |
+|------|--------|
+| `src/turboquant/quantizer_prod_torch.py` | `_outlier_perm`, `_bits_hi`, `_bits_lo`, `_n_out`; `quantize_with_norm` splits output into two buckets |
+| `src/turboquant/quantizer_mse_torch.py` | Same for V quantizer |
+| `src/turboquant/integrations/hf_cache.py` | `_BatchedKeyStore.mse_packed_hi` / `_lo`; `_BatchedValueStore.idx_packed_hi` / `_lo`; `TurboQuantCache(outlier_frac=...)` |
+| `src/turboquant/kernels/decompress_attn.py` | `_attn_split_kernel` accepts two buckets + `N_OUT` constexpr; single-bucket fallback when `N_OUT == 0` |
+| `src/turboquant/calibration.py` (new) | `calibrate_outliers(quantizer, calib_batch, n_out) -> LongTensor[H,D]` |
+| `tests/test_outlier_split_parity.py` (new) | Kernel parity across `(B, H_q, H_kv, S, D, b_hi, b_lo, n_out)` sweep |
+| `tests/test_calibration.py` (new) | Calibration picks scaled channels on synthetic data |
+
+### Order of Operations
+
+1. Split-bucket storage with `n_out = 0` = Phase 13 behavior. Commit.
+2. Kernel two-region unpack with `N_OUT=0` fallback. Commit after parity.
+3. Add calibration, enable `outlier_frac > 0`. Commit.
+4. Measure compression + perplexity; update spec. Commit.
+
+### Definition of Done
+
+- `pytest tests/test_outlier_split_parity.py tests/test_calibration.py`
+  green with `outlier_frac ∈ {0, 0.25}` across shape sweep.
+- `scripts/measure_compression.py --bits-avg 2.5 --outlier-frac 0.25`
+  emits ≥ 5.3× ratio.
+- Non-regression: graph perf gate still ≤ 2.4× SDPA.
+- End-to-end: `model.generate` on Llama-3.1-8B at `(outlier_frac=0.25,
+  bits_avg=3.5)` shows WikiText-2 perplexity within 0.1 of `bits=4`
+  single-bucket (matches paper Table 2 comparable compression row).
 
 ---
 
-## Phase 13: Evaluation Suite
+## Phase 15: Evaluation Suite
 
 ### Goal
 
@@ -778,7 +839,7 @@ Metrics: F1 (QA), ROUGE-L (summarization), accuracy (classification).
 
 ---
 
-## Phase 14: llama.cpp Fork
+## Phase 16: llama.cpp Fork
 
 ### Goal
 
@@ -857,7 +918,7 @@ llama-cli -m model.gguf \
 
 ### Dependencies
 
-- Phase 10 evaluation results for validation targets.
+- Phase 15 evaluation results for validation targets.
 - CMake, CUDA toolkit, C++17 compiler.
 
 ### Risks
@@ -877,9 +938,9 @@ llama-cli -m model.gguf \
 
 ---
 
-## Phase 15+: Production Hardening
+## Phase 17+: Production Hardening
 
-### 15a: Performance Optimization
+### 17a: Performance Optimization
 
 - Profile the dequantization hotpath (likely the d x d matmul for unrotation).
 - Investigate randomized Hadamard transform as O(d log d) alternative to
@@ -887,34 +948,30 @@ llama-cli -m model.gguf \
 - Batch per-head quantization into single large matmul operations.
 - Explore incremental attention: compute attention scores directly from
   compressed representation without full dequantization.
+- Revisit Phase 9 speed DoD (fused decode ≥ FP16 SDPA tok/s) in the context
+  of a production kernel stack (vLLM / SGLang) — current bottleneck is
+  compute-bound fp32 dequant inside `_attn_split_kernel` vs tensor-core
+  SDPA.
 
-### 15b: Outlier Channel Strategy
-
-- Implement the paper's 2.5-bit and 3.5-bit configurations.
-- Per-layer outlier detection based on activation magnitude statistics.
-- Mixed bit-width cache: outlier channels at (b+1) bits, normal at b bits.
-- This requires a lightweight calibration pass (small departure from the
-  fully data-oblivious design, but consistent with the paper's approach).
-
-### 15c: Documentation
+### 17b: Documentation
 
 - Jupyter notebook demonstrating KV cache compression on Llama-3.1-8B.
 - API reference documentation (Sphinx or MkDocs).
 - Performance comparison charts (distortion vs bit-width, throughput vs
   sequence length).
 
-### 15d: CI/CD Pipeline
+### 17c: CI/CD Pipeline
 
 - GitHub Actions on push: pytest, ruff lint, mypy type check.
 - GPU tests on a self-hosted runner or triggered manually.
 - Benchmark regression tracking (flag if perplexity degrades > 0.5%).
 
-### 15e: Distribution
+### 17d: Distribution
 
 - PyPI package publication (once API is stable).
 - HuggingFace model cards showing TurboQuant benchmark results.
 
-### 15f: H100 / FP8 Support
+### 17e: H100 / FP8 Support
 
 Target hardware: NVIDIA H100 (SM 90) with native FP8 tensor cores.
 
