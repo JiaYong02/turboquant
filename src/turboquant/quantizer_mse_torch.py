@@ -111,12 +111,23 @@ class BatchedTurboQuantMSETorch:
     Uses stacked [H, D, D] rotation matrices and a shared Lloyd-Max codebook
     to quantize all heads in a single batched GPU call.
 
+    Optional outlier-channel split (Phase B): when `n_out > 0`, the rotated
+    coordinates are split into an outlier prefix `[0, n_out)` quantized at
+    `bits_hi` bits and a regular suffix `[n_out, D)` at `bits_lo` bits. The
+    rotation is assumed to already place outliers in the prefix (calibration
+    lives outside this class). `n_out == 0` is bit-identical to the old
+    single-bucket behavior.
+
     Args:
         d: Vector dimension.
-        b: Bits per coordinate.
+        b: Bits per coordinate (single-bucket path; ignored when n_out > 0).
         num_heads: Number of heads (H).
         seeds: List of H rotation seeds, one per head.
         device: Target device.
+        n_out: Number of outlier channels in the rotated prefix. 0 disables
+            the split.
+        bits_hi: Bit-width for the outlier bucket. Required when n_out > 0.
+        bits_lo: Bit-width for the regular bucket. Required when n_out > 0.
     """
 
     def __init__(
@@ -126,13 +137,35 @@ class BatchedTurboQuantMSETorch:
         num_heads: int,
         seeds: list[int],
         device: torch.device | str | None = None,
+        *,
+        n_out: int = 0,
+        bits_hi: int | None = None,
+        bits_lo: int | None = None,
     ):
+        if n_out < 0 or n_out > d:
+            raise ValueError(f"n_out must be in [0, d]; got n_out={n_out}, d={d}")
+        if n_out > 0 and (bits_hi is None or bits_lo is None):
+            raise ValueError("bits_hi and bits_lo are required when n_out > 0")
+
         self.d = d
         self.b = b
         self.num_heads = num_heads
+        self.n_out = n_out
+        self.bits_hi = bits_hi
+        self.bits_lo = bits_lo
         self.rotation = BatchedRandomRotationTorch(d, num_heads, seeds, device)
-        # Codebook is shared across heads (same distribution for all).
-        self.codebook = LloydMaxCodebookTorch(d, b, device=device)
+
+        if n_out == 0:
+            # Codebook is shared across heads (same distribution for all).
+            self.codebook = LloydMaxCodebookTorch(d, b, device=device)
+            self.codebook_hi: LloydMaxCodebookTorch | None = None
+            self.codebook_lo: LloydMaxCodebookTorch | None = None
+        else:
+            # `d` drives the rotated-coord Beta(1/2, (D-1)/2) marginal, so it
+            # stays at the full dimension for both buckets.
+            self.codebook = None  # type: ignore[assignment]
+            self.codebook_hi = LloydMaxCodebookTorch(d, bits_hi, device=device)
+            self.codebook_lo = LloydMaxCodebookTorch(d, bits_lo, device=device)
 
     def quantize(self, x: torch.Tensor) -> dict:
         """Quantize unit vectors for all heads.
@@ -141,23 +174,34 @@ class BatchedTurboQuantMSETorch:
             x: float32 tensor of shape (H, N, D), assumed unit norm.
 
         Returns:
-            Dict with 'idx': uint8 tensor of shape (H, N, D).
+            Single-bucket mode: dict with 'idx' uint8 [H, N, D].
+            Split-bucket mode (n_out > 0): dict with 'idx_hi' uint8
+            [H, N, n_out] and 'idx_lo' uint8 [H, N, D - n_out].
         """
         y = self.rotation.rotate(x)       # [H, N, D]
-        idx = self.codebook.quantize(y)   # [H, N, D] uint8
-        return {"idx": idx}
+        if self.n_out == 0:
+            idx = self.codebook.quantize(y)   # [H, N, D] uint8
+            return {"idx": idx}
+        idx_hi = self.codebook_hi.quantize(y[..., : self.n_out].contiguous())
+        idx_lo = self.codebook_lo.quantize(y[..., self.n_out :].contiguous())
+        return {"idx_hi": idx_hi, "idx_lo": idx_lo}
 
     def dequantize(self, quantized: dict) -> torch.Tensor:
         """Reconstruct unit vectors from indices for all heads.
 
         Args:
-            quantized: Dict with 'idx' (uint8 [H, N, D]) from quantize().
+            quantized: Dict from quantize().
 
         Returns:
             float32 tensor of shape (H, N, D).
         """
-        y_tilde = self.codebook.dequantize(quantized["idx"])  # [H, N, D]
-        return self.rotation.unrotate(y_tilde)                # [H, N, D]
+        if self.n_out == 0:
+            y_tilde = self.codebook.dequantize(quantized["idx"])  # [H, N, D]
+        else:
+            y_hi = self.codebook_hi.dequantize(quantized["idx_hi"])
+            y_lo = self.codebook_lo.dequantize(quantized["idx_lo"])
+            y_tilde = torch.cat([y_hi, y_lo], dim=-1)             # [H, N, D]
+        return self.rotation.unrotate(y_tilde)                    # [H, N, D]
 
     def quantize_with_norm(
         self, x: torch.Tensor

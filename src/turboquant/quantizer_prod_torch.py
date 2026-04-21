@@ -151,13 +151,43 @@ class BatchedTurboQuantProdTorch:
         mse_seeds: list[int],
         qjl_seeds: list[int],
         device: torch.device | str | None = None,
+        *,
+        n_out: int = 0,
+        bits_hi: int | None = None,
+        bits_lo: int | None = None,
     ):
+        if n_out < 0 or n_out > d:
+            raise ValueError(f"n_out must be in [0, d]; got n_out={n_out}, d={d}")
+        if n_out > 0 and (bits_hi is None or bits_lo is None):
+            raise ValueError("bits_hi and bits_lo are required when n_out > 0")
+        if n_out > 0 and (bits_hi < 2 or bits_lo < 2):
+            # Prod needs at least one MSE bit after subtracting the QJL bit.
+            raise ValueError(
+                "bits_hi and bits_lo must both be >= 2 for Prod (one bit goes "
+                f"to QJL); got bits_hi={bits_hi}, bits_lo={bits_lo}"
+            )
+
         self.d = d
         self.b = b
         self.num_heads = num_heads
+        self.n_out = n_out
+        self.bits_hi = bits_hi
+        self.bits_lo = bits_lo
 
-        if b > 1:
+        if n_out > 0:
+            # K-side MSE takes (bucket_bits - 1); QJL contributes the final bit.
             self.mse: BatchedTurboQuantMSETorch | None = BatchedTurboQuantMSETorch(
+                d,
+                b=bits_hi - 1,  # single-bucket fallback param; unused when n_out>0
+                num_heads=num_heads,
+                seeds=mse_seeds,
+                device=device,
+                n_out=n_out,
+                bits_hi=bits_hi - 1,
+                bits_lo=bits_lo - 1,
+            )
+        elif b > 1:
+            self.mse = BatchedTurboQuantMSETorch(
                 d, b - 1, num_heads, mse_seeds, device
             )
         else:
