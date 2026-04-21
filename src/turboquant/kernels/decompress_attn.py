@@ -129,15 +129,20 @@ def _attn_split_kernel(
     qjl_byte_idx = d_off // VPB_QJL
     qjl_shift = (VPB_QJL - 1 - (d_off % VPB_QJL)).to(tl.int32)
 
-    VPB_MSE: tl.constexpr = 8 // MSE_BITS if MSE_BITS > 0 else 1
+    # Bit-tight unpack: value i occupies bits [i*n_bits, (i+1)*n_bits) in the
+    # MSB-first stream. Read a 16-bit window (byte_lo, byte_hi), shift down,
+    # and mask. A value may span two adjacent bytes.
     mse_mask_val: tl.constexpr = (1 << MSE_BITS) - 1 if MSE_BITS > 0 else 0
-    mse_byte_idx = d_off // VPB_MSE
-    mse_shift = ((VPB_MSE - 1 - (d_off % VPB_MSE)) * MSE_BITS).to(tl.int32)
+    mse_bit_off = d_off * MSE_BITS
+    mse_byte_lo = mse_bit_off // 8
+    mse_byte_hi = mse_byte_lo + 1
+    mse_shift_down = (16 - MSE_BITS - (mse_bit_off % 8)).to(tl.int32)
 
-    VPB_VAL: tl.constexpr = 8 // VAL_BITS
     val_mask_val: tl.constexpr = (1 << VAL_BITS) - 1
-    val_byte_idx = d_off // VPB_VAL
-    val_shift = ((VPB_VAL - 1 - (d_off % VPB_VAL)) * VAL_BITS).to(tl.int32)
+    val_bit_off = d_off * VAL_BITS
+    val_byte_lo = val_bit_off // 8
+    val_byte_hi = val_byte_lo + 1
+    val_shift_down = (16 - VAL_BITS - (val_bit_off % 8)).to(tl.int32)
 
     m_run = -float("inf")
     l_run = 0.0
@@ -165,12 +170,19 @@ def _attn_split_kernel(
             signs = qjl_bits.to(tl.float32) * 2.0 - 1.0
 
             if MSE_BITS > 0:
-                mse_ptrs = (
-                    mse_packed_ptr + kv_base_mse
-                    + s_off[:, None] * smp_s + mse_byte_idx[None, :]
-                )
-                mse_bytes = tl.load(mse_ptrs, mask=s_mask[:, None], other=0).to(tl.int32)
-                mse_vals = (mse_bytes >> mse_shift[None, :]) & mse_mask_val
+                mse_base = mse_packed_ptr + kv_base_mse + s_off[:, None] * smp_s
+                mse_lo = tl.load(
+                    mse_base + mse_byte_lo[None, :],
+                    mask=s_mask[:, None],
+                    other=0,
+                ).to(tl.int32)
+                mse_hi = tl.load(
+                    mse_base + mse_byte_hi[None, :],
+                    mask=s_mask[:, None] & (mse_byte_hi[None, :] < smp_s),
+                    other=0,
+                ).to(tl.int32)
+                mse_word = (mse_lo << 8) | mse_hi
+                mse_vals = (mse_word >> mse_shift_down[None, :]) & mse_mask_val
                 key_cent = tl.load(key_centroids_ptr + mse_vals)
             else:
                 key_cent = tl.zeros([BLOCK_N, D], dtype=tl.float32)
@@ -192,12 +204,19 @@ def _attn_split_kernel(
             p = tl.exp(logits - m_new)
             l_run = l_run * alpha + tl.sum(p, axis=0)
 
-            val_ptrs = (
-                val_idx_packed_ptr + kv_base_vp
-                + s_off[:, None] * svp_s + val_byte_idx[None, :]
-            )
-            v_bytes = tl.load(val_ptrs, mask=s_mask[:, None], other=0).to(tl.int32)
-            v_vals = (v_bytes >> val_shift[None, :]) & val_mask_val
+            val_base = val_idx_packed_ptr + kv_base_vp + s_off[:, None] * svp_s
+            v_lo = tl.load(
+                val_base + val_byte_lo[None, :],
+                mask=s_mask[:, None],
+                other=0,
+            ).to(tl.int32)
+            v_hi = tl.load(
+                val_base + val_byte_hi[None, :],
+                mask=s_mask[:, None] & (val_byte_hi[None, :] < svp_s),
+                other=0,
+            ).to(tl.int32)
+            v_word = (v_lo << 8) | v_hi
+            v_vals = (v_word >> val_shift_down[None, :]) & val_mask_val
             val_cent = tl.load(val_centroids_ptr + v_vals)
 
             norms_v = tl.load(
@@ -417,6 +436,12 @@ def fused_decompress_attention_triton(
     # --- Gather packed tensors --------------------------------------------
     # gamma / norms are fp16 in storage (Phase A); kernel upcasts per-element
     # via `tl.load(...).to(tl.float32)` so no whole-buffer cast here.
+    #
+    # NOTE: `mse_packed` / `val_idx_packed` MUST be contiguous in the last
+    # dim. The kernel uses `smp_s` / `svp_s` (per-S stride) as the packed_D
+    # bound in its hi-byte OOB mask for the 16-bit-window bit-tight unpack;
+    # that is correct only when `stride[-1] == 1` and `stride[-2] == packed_D`.
+    # A non-contiguous view would silently read into the next token's bytes.
     qjl_packed = key_store.qjl_packed.contiguous()
     gamma = key_store.gamma.contiguous()
     norms_k = key_store.norms.contiguous()

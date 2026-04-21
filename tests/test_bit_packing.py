@@ -14,12 +14,14 @@ from turboquant.bit_packing import (
 
 class TestPackedDim:
     @pytest.mark.parametrize("d,n_bits,expected", [
-        (128, 1, 16),   # 8 per byte
-        (128, 2, 32),   # 4 per byte
-        (128, 3, 64),   # 2 per byte (3-bit: 6 bits used, 2 wasted per byte)
-        (128, 4, 64),   # 2 per byte
+        (128, 1, 16),   # ceil(128*1/8) = 16
+        (128, 2, 32),   # ceil(128*2/8) = 32
+        (128, 3, 48),   # ceil(128*3/8) = 48 (bit-tight)
+        (128, 4, 64),   # ceil(128*4/8) = 64
+        (128, 5, 80),   # ceil(128*5/8) = 80 (bit-tight)
+        (128, 6, 96),   # ceil(128*6/8) = 96 (bit-tight)
         (7,   1, 1),    # ceil(7/8) = 1
-        (9,   2, 3),    # ceil(9/4) = 3
+        (9,   2, 3),    # ceil(9*2/8) = 3
     ])
     def test_packed_dim(self, d, n_bits, expected):
         assert packed_dim(d, n_bits) == expected
@@ -28,7 +30,7 @@ class TestPackedDim:
 class TestRoundTrip:
     """pack → unpack must recover the original values exactly."""
 
-    @pytest.mark.parametrize("n_bits", [1, 2, 3, 4])
+    @pytest.mark.parametrize("n_bits", [1, 2, 3, 4, 5, 6])
     def test_1d_round_trip(self, n_bits):
         n_vals = 128
         max_val = (1 << n_bits) - 1
@@ -37,7 +39,7 @@ class TestRoundTrip:
         recovered = unpack_bits(packed, n_bits, n_vals)
         torch.testing.assert_close(recovered, values)
 
-    @pytest.mark.parametrize("n_bits", [1, 2, 3, 4])
+    @pytest.mark.parametrize("n_bits", [1, 2, 3, 4, 5, 6])
     def test_2d_round_trip(self, n_bits):
         max_val = (1 << n_bits) - 1
         values = torch.randint(0, max_val + 1, (10, 128), dtype=torch.uint8)
@@ -45,7 +47,7 @@ class TestRoundTrip:
         recovered = unpack_bits(packed, n_bits, 128)
         torch.testing.assert_close(recovered, values)
 
-    @pytest.mark.parametrize("n_bits", [1, 2, 3, 4])
+    @pytest.mark.parametrize("n_bits", [1, 2, 3, 4, 5, 6])
     def test_4d_round_trip(self, n_bits):
         """Typical cache tensor shape [H, B, S, D]."""
         max_val = (1 << n_bits) - 1
@@ -55,7 +57,7 @@ class TestRoundTrip:
         recovered = unpack_bits(packed, n_bits, D)
         torch.testing.assert_close(recovered, values)
 
-    @pytest.mark.parametrize("n_bits", [1, 2, 3, 4])
+    @pytest.mark.parametrize("n_bits", [1, 2, 3, 4, 5, 6])
     def test_non_multiple_of_vpb(self, n_bits):
         """D that is not a multiple of values-per-byte must still round-trip."""
         D = 7  # 7 is not divisible by 2 or 4 or 8
@@ -72,8 +74,10 @@ class TestPackedSize:
     @pytest.mark.parametrize("n_bits,D,expected_packed", [
         (1,  128, 16),
         (2,  128, 32),
-        (3,  128, 64),
+        (3,  128, 48),   # bit-tight: ceil(128*3/8)
         (4,  128, 64),
+        (5,  128, 80),   # bit-tight: ceil(128*5/8)
+        (6,  128, 96),   # bit-tight: ceil(128*6/8)
         (1,   64,  8),
         (4,   64, 32),
     ])
@@ -124,7 +128,7 @@ class TestSignsRoundTrip:
 class TestCompressionSavings:
     """Packing must actually reduce tensor size compared to uint8 storage."""
 
-    @pytest.mark.parametrize("n_bits", [1, 2, 3, 4])
+    @pytest.mark.parametrize("n_bits", [1, 2, 3, 4, 5, 6])
     def test_packed_smaller_than_unpacked(self, n_bits):
         D = 128
         max_val = (1 << n_bits) - 1
