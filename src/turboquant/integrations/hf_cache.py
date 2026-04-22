@@ -6,19 +6,21 @@ compresses keys with TurboQuantProd and values with TurboQuantMSE.
 Storage layout
 --------------
 All heads for a layer are stored together in [H, B, S, ...] tensors.
-Indices are bit-packed so actual storage matches theoretical bit widths:
+Indices are bit-tight packed (see ``bit_packing.py``) so actual storage is
+``ceil(D * n_bits / 8)`` bytes per vector, independent of ``n_bits``:
 
   Keys (TurboQuantProd at b bits):
-    mse_packed : uint8 [H, B, S, ceil(D*(b-1)/8/vpb)]  — (b-1)-bit MSE indices
-    qjl_packed : uint8 [H, B, S, ceil(D/8)]             — 1-bit QJL signs
-    gamma      : f32   [H, B, S]                         — residual norms
-    norms      : f32   [H, B, S]                         — input norms
+    mse_packed : uint8 [H, B, S, ceil(D*(b-1)/8)]  — (b-1)-bit MSE indices
+    qjl_packed : uint8 [H, B, S, ceil(D/8)]        — 1-bit QJL signs
+    gamma      : f16   [H, B, S]                   — residual norms
+    norms      : f16   [H, B, S]                   — input norms
 
   Values (TurboQuantMSE at b bits):
-    idx_packed : uint8 [H, B, S, ceil(D*b/8/vpb)]       — b-bit MSE indices
-    norms      : f32   [H, B, S]                         — input norms
+    idx_packed : uint8 [H, B, S, ceil(D*b/8)]      — b-bit MSE indices
+    norms      : f16   [H, B, S]                   — input norms
 
-where vpb = 8 // b (values per byte for b-bit packing).
+In split-bucket mode (``n_out > 0``), ``mse_packed`` / ``idx_packed`` are
+replaced by ``_hi`` / ``_lo`` pairs sized to the two buckets.
 """
 
 from __future__ import annotations
@@ -89,8 +91,17 @@ class _BatchedKeyStore:
                 f"n_out must be in [0, head_dim]; got n_out={n_out}, "
                 f"head_dim={head_dim}"
             )
-        if n_out > 0 and (bits_hi is None or bits_lo is None):
-            raise ValueError("bits_hi and bits_lo are required when n_out > 0")
+        if n_out > 0:
+            if bits_hi is None or bits_lo is None:
+                raise ValueError("bits_hi and bits_lo are required when n_out > 0")
+            # K-stage MSE uses (bits - 1); QJL supplies the final bit, so each
+            # bucket needs at least 2 total bits to leave 1 bit for MSE.
+            if bits_hi < 2 or bits_lo < 2:
+                raise ValueError(
+                    "bits_hi and bits_lo must be >= 2 for the K store "
+                    f"(one bit goes to QJL); got bits_hi={bits_hi}, "
+                    f"bits_lo={bits_lo}"
+                )
 
         self.key_bits = key_bits
         self.head_dim = head_dim
@@ -202,6 +213,8 @@ class _BatchedKeyStore:
         self._slab_B = None
 
     def seq_length(self) -> int:
+        # qjl_packed is always populated (QJL stays 1-bit full-D regardless of
+        # split-bucket mode), so it's the canonical seq-length witness.
         if self._slab_active:
             return self._seq_len
         return 0 if self.qjl_packed is None else self.qjl_packed.shape[2]
@@ -438,8 +451,15 @@ class _BatchedValueStore:
                 f"n_out must be in [0, head_dim]; got n_out={n_out}, "
                 f"head_dim={head_dim}"
             )
-        if n_out > 0 and (bits_hi is None or bits_lo is None):
-            raise ValueError("bits_hi and bits_lo are required when n_out > 0")
+        if n_out > 0:
+            if bits_hi is None or bits_lo is None:
+                raise ValueError("bits_hi and bits_lo are required when n_out > 0")
+            # V stage uses full bit-widths with no QJL stage; require >= 1.
+            if bits_hi < 1 or bits_lo < 1:
+                raise ValueError(
+                    "bits_hi and bits_lo must be >= 1 for the V store; "
+                    f"got bits_hi={bits_hi}, bits_lo={bits_lo}"
+                )
 
         self.value_bits = value_bits
         self.head_dim = head_dim
@@ -676,7 +696,12 @@ class _BatchedValueStore:
             self.idx_packed_lo = self.idx_packed_lo.repeat_interleave(repeats, dim=1)
         self.norms = self.norms.repeat_interleave(repeats, dim=1)
         if self._slab_active:
-            self._slab_B = int(self._primary_packed().shape[1])
+            new_B = (
+                self.idx_packed.shape[1]
+                if self.idx_packed is not None
+                else self.idx_packed_hi.shape[1]
+            )
+            self._slab_B = int(new_B)
 
     def batch_select_indices(self, indices: torch.Tensor) -> None:
         primary = self._primary_packed()
@@ -1299,9 +1324,19 @@ class TurboQuantCache(Cache):
         key_bits: Bits per coordinate for key quantization (default 4).
         value_bits: Bits per coordinate for value quantization (default 4).
         per_layer_bits: Optional per-layer overrides, e.g.
-            {0: {"key_bits": 3, "value_bits": 4}}.
+            ``{0: {"key_bits": 3, "value_bits": 4}}``. When ``outlier_frac > 0``
+            and no explicit bucket widths are provided, each layer's
+            ``key_bits_hi/lo`` defaults to ``(kb + 1, kb - 1)`` derived from
+            the layer's own (possibly overridden) ``key_bits`` — and similarly
+            for values.
         seed: Base random seed for reproducibility.
         device: Target device for quantizer matrices.
+        outlier_frac: Fraction of head-dim channels quantized at higher bits
+            (paper heuristic, Phase B). ``0.0`` disables the split.
+        key_bits_hi/key_bits_lo: Explicit outlier / regular bit widths for
+            keys. If unset, defaults follow the paper formula
+            ``hi = key_bits + 1``, ``lo = key_bits - 1``.
+        value_bits_hi/value_bits_lo: Same for values.
 
     Example::
 
@@ -1356,23 +1391,67 @@ class TurboQuantCache(Cache):
         )
 
         # Outlier split (Phase B): n_out channels quantized at higher bits,
-        # remainder at lower bits. Defaults match paper formula when
-        # bits_hi/bits_lo are not supplied (hi = b+1, lo = b-1).
+        # remainder at lower bits. Defaults follow the paper formula when
+        # explicit bucket widths aren't supplied (hi = b+1, lo = b-1).
         if not (0.0 <= outlier_frac < 1.0):
             raise ValueError(
                 f"outlier_frac must be in [0, 1); got {outlier_frac}"
             )
         n_out = int(round(outlier_frac * head_dim)) if outlier_frac > 0 else 0
-        kbh = key_bits_hi if key_bits_hi is not None else key_bits + 1
-        kbl = key_bits_lo if key_bits_lo is not None else key_bits - 1
-        vbh = value_bits_hi if value_bits_hi is not None else value_bits + 1
-        vbl = value_bits_lo if value_bits_lo is not None else value_bits - 1
+
+        def _resolve_bits(
+            stage: str,
+            base_bits: int,
+            hi_override: int | None,
+            lo_override: int | None,
+            min_bits: int,
+        ) -> tuple[int | None, int | None]:
+            """Derive bucket widths from base bits + optional overrides.
+
+            Returns (None, None) when split mode is off. Validates that the
+            resolved widths are within the kernel's supported range.
+            """
+            if n_out == 0:
+                return None, None
+            hi = hi_override if hi_override is not None else base_bits + 1
+            lo = lo_override if lo_override is not None else base_bits - 1
+            # bit_packing supports n_bits in [1, 6]; K stage packs (bits - 1)
+            # so the hi-stage ceiling is 7; V stage packs full bits => 6.
+            max_bits = 7 if stage == "key" else 6
+            if hi < min_bits or hi > max_bits:
+                raise ValueError(
+                    f"{stage}_bits_hi must be in [{min_bits}, {max_bits}]; "
+                    f"got {hi} (base_bits={base_bits}, outlier_frac={outlier_frac})"
+                )
+            if lo < min_bits or lo > max_bits:
+                raise ValueError(
+                    f"{stage}_bits_lo must be in [{min_bits}, {max_bits}]; "
+                    f"got {lo} (base_bits={base_bits}, outlier_frac={outlier_frac})"
+                )
+            return hi, lo
 
         layers = []
         for i in range(num_layers):
             layer_cfg = per_layer_bits.get(i, {})
             kb = layer_cfg.get("key_bits", key_bits)
             vb = layer_cfg.get("value_bits", value_bits)
+            # Per-layer overrides can also specify bucket widths directly;
+            # otherwise derive from this layer's own kb/vb so overrides stay
+            # internally consistent.
+            kbh_i, kbl_i = _resolve_bits(
+                "key",
+                kb,
+                layer_cfg.get("key_bits_hi", key_bits_hi),
+                layer_cfg.get("key_bits_lo", key_bits_lo),
+                min_bits=2,  # K stage: QJL needs 1 bit, MSE needs >= 1
+            )
+            vbh_i, vbl_i = _resolve_bits(
+                "value",
+                vb,
+                layer_cfg.get("value_bits_hi", value_bits_hi),
+                layer_cfg.get("value_bits_lo", value_bits_lo),
+                min_bits=1,  # V stage: MSE only
+            )
             layers.append(
                 TurboQuantCacheLayer(
                     layer_idx=i,
@@ -1387,10 +1466,10 @@ class TurboQuantCache(Cache):
                     use_cuda_graph=graph_enabled,
                     graph_pool=graph_pool,
                     n_out=n_out,
-                    key_bits_hi=kbh if n_out > 0 else None,
-                    key_bits_lo=kbl if n_out > 0 else None,
-                    value_bits_hi=vbh if n_out > 0 else None,
-                    value_bits_lo=vbl if n_out > 0 else None,
+                    key_bits_hi=kbh_i,
+                    key_bits_lo=kbl_i,
+                    value_bits_hi=vbh_i,
+                    value_bits_lo=vbl_i,
                 )
             )
 

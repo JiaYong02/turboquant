@@ -35,7 +35,8 @@ class TestKeyStoreSingleBucketParity:
         q, norms = quant.quantize_with_norm(x)
         store.append(q, norms, B=1, S_new=8)
         assert store.mse_packed is not None
-        assert not hasattr(store, "mse_packed_hi") or store.mse_packed_hi is None
+        assert store.mse_packed_hi is None
+        assert store.mse_packed_lo is None
         q_out, norms_out = store.to_quantized_dict()
         assert set(q_out["mse"].keys()) == {"idx"}
 
@@ -152,6 +153,22 @@ class TestValueStoreSplitBucket:
         x_hat = quant.dequantize_with_norm(q_out, norms_out)
         assert x_hat.shape == (H, N, D)
         assert torch.isfinite(x_hat).all()
+
+
+class TestStoreValidation:
+    """Validation guards on direct store construction (M4)."""
+
+    def test_key_store_rejects_low_bits(self) -> None:
+        with pytest.raises(ValueError, match=">= 2"):
+            _BatchedKeyStore(
+                key_bits=4, head_dim=128, n_out=32, bits_hi=4, bits_lo=1
+            )
+
+    def test_value_store_rejects_zero_bits(self) -> None:
+        with pytest.raises(ValueError, match=">= 1"):
+            _BatchedValueStore(
+                value_bits=4, head_dim=128, n_out=32, bits_hi=4, bits_lo=0
+            )
 
 
 class TestAppendAcrossSteps:
