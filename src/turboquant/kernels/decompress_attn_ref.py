@@ -49,17 +49,51 @@ def _decode_key_centroids(
     """Centroid LUT for the (b-1)-bit MSE stage of the key Prod quantizer.
 
     Returns a 1-D float32 tensor of length 2**(b-1) (or empty for b=1).
+    Only valid in single-bucket mode (n_out == 0).
     """
     if key_quantizer.mse is None:
         return torch.empty(0, dtype=torch.float32)
+    if key_quantizer.n_out > 0:
+        raise ValueError(
+            "use _decode_key_centroids_split for split-bucket quantizers"
+        )
     return key_quantizer.mse.codebook._centroids.to(torch.float32)
 
 
 def _decode_value_centroids(
     value_quantizer: BatchedTurboQuantMSETorch,
 ) -> torch.Tensor:
-    """Centroid LUT for the b-bit MSE value quantizer."""
+    """Centroid LUT for the b-bit MSE value quantizer (single-bucket)."""
+    if value_quantizer.n_out > 0:
+        raise ValueError(
+            "use _decode_value_centroids_split for split-bucket quantizers"
+        )
     return value_quantizer.codebook._centroids.to(torch.float32)
+
+
+def _decode_key_centroids_split(
+    key_quantizer: BatchedTurboQuantProdTorch,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Centroid LUTs for the K-stage MSE hi/lo codebooks in split-bucket mode."""
+    if key_quantizer.n_out == 0 or key_quantizer.mse is None:
+        raise ValueError("split centroid LUTs require n_out > 0")
+    mse = key_quantizer.mse
+    return (
+        mse.codebook_hi._centroids.to(torch.float32),
+        mse.codebook_lo._centroids.to(torch.float32),
+    )
+
+
+def _decode_value_centroids_split(
+    value_quantizer: BatchedTurboQuantMSETorch,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Centroid LUTs for the V-stage hi/lo codebooks in split-bucket mode."""
+    if value_quantizer.n_out == 0:
+        raise ValueError("split centroid LUTs require n_out > 0")
+    return (
+        value_quantizer.codebook_hi._centroids.to(torch.float32),
+        value_quantizer.codebook_lo._centroids.to(torch.float32),
+    )
 
 
 def fused_decompress_attention_ref(
@@ -108,7 +142,10 @@ def fused_decompress_attention_ref(
         )
     gqa_groups = H_q // H_kv
 
-    if key_store.qjl_packed is None or value_store.idx_packed is None:
+    value_empty = (
+        value_store.idx_packed is None and value_store.idx_packed_hi is None
+    )
+    if key_store.qjl_packed is None or value_empty:
         raise ValueError("KV store is empty; nothing to attend over")
 
     S_total = key_store.seq_length()
@@ -133,12 +170,37 @@ def fused_decompress_attention_ref(
     gamma = q_k_dict["gamma"].reshape(H_kv, B, S_total).to(torch.float32)
     norms_k = norms_k_flat.reshape(H_kv, B, S_total).to(torch.float32)
 
-    if q_k_dict["mse"] is not None:
-        key_mse_idx = q_k_dict["mse"]["idx"].reshape(H_kv, B, S_total, D)
-    else:
-        key_mse_idx = None
+    split_mode = key_quantizer.n_out > 0
+    if split_mode != (value_quantizer.n_out > 0):
+        raise ValueError(
+            "key and value quantizers must agree on split-bucket mode; "
+            f"got key.n_out={key_quantizer.n_out}, "
+            f"value.n_out={value_quantizer.n_out}"
+        )
 
-    val_idx = q_v_dict["idx"].reshape(H_kv, B, S_total, D)
+    n_out = key_quantizer.n_out if split_mode else 0
+    key_mse_idx_hi = key_mse_idx_lo = None
+    val_idx_hi = val_idx_lo = None
+    key_mse_idx = None
+    val_idx = None
+    if split_mode:
+        if value_quantizer.n_out != n_out:
+            raise ValueError(
+                f"key.n_out={n_out} must equal value.n_out="
+                f"{value_quantizer.n_out}"
+            )
+        mse_d = q_k_dict["mse"]
+        if mse_d is None or "idx_hi" not in mse_d:
+            raise ValueError("split-bucket key store missing idx_hi/idx_lo")
+        key_mse_idx_hi = mse_d["idx_hi"].reshape(H_kv, B, S_total, n_out)
+        key_mse_idx_lo = mse_d["idx_lo"].reshape(H_kv, B, S_total, D - n_out)
+        val_idx_hi = q_v_dict["idx_hi"].reshape(H_kv, B, S_total, n_out)
+        val_idx_lo = q_v_dict["idx_lo"].reshape(H_kv, B, S_total, D - n_out)
+    else:
+        if q_k_dict["mse"] is not None:
+            key_mse_idx = q_k_dict["mse"]["idx"].reshape(H_kv, B, S_total, D)
+        val_idx = q_v_dict["idx"].reshape(H_kv, B, S_total, D)
+
     norms_v = norms_v_flat.reshape(H_kv, B, S_total).to(torch.float32)
 
     # ---- 2. Per-head rotation / projection matrices ---------------------------
@@ -147,8 +209,19 @@ def fused_decompress_attention_ref(
     S_k = key_quantizer.qjl.S.to(device=device, dtype=torch.float32)  # [H_kv,D,D]
     Pi_v = value_quantizer.rotation.Pi.to(device=device, dtype=torch.float32)
 
-    key_centroids = _decode_key_centroids(key_quantizer).to(device)
-    val_centroids = _decode_value_centroids(value_quantizer).to(device)
+    if split_mode:
+        key_cent_hi, key_cent_lo = _decode_key_centroids_split(key_quantizer)
+        val_cent_hi, val_cent_lo = _decode_value_centroids_split(value_quantizer)
+        key_cent_hi = key_cent_hi.to(device)
+        key_cent_lo = key_cent_lo.to(device)
+        val_cent_hi = val_cent_hi.to(device)
+        val_cent_lo = val_cent_lo.to(device)
+        key_centroids = None
+        val_centroids = None
+    else:
+        key_centroids = _decode_key_centroids(key_quantizer).to(device)
+        val_centroids = _decode_value_centroids(value_quantizer).to(device)
+        key_cent_hi = key_cent_lo = val_cent_hi = val_cent_lo = None
 
     qjl_const = _QJL_C / D
 
@@ -185,17 +258,41 @@ def fused_decompress_attention_ref(
         qjl_tile = qjl[:, :, s_start:s_end, :].index_select(0, kv_for_q)
         gamma_tile = gamma[:, :, s_start:s_end].index_select(0, kv_for_q)
         norms_k_tile = norms_k[:, :, s_start:s_end].index_select(0, kv_for_q)
-        val_idx_tile = val_idx[:, :, s_start:s_end, :].index_select(0, kv_for_q)
         norms_v_tile = norms_v[:, :, s_start:s_end].index_select(0, kv_for_q)
 
         # MSE centroid tile: [H_q, B, Sn, D]
-        if key_mse_idx is not None:
-            key_mse_tile = key_mse_idx[:, :, s_start:s_end, :].index_select(
+        if split_mode:
+            hi_k_tile = key_mse_idx_hi[:, :, s_start:s_end, :].index_select(
+                0, kv_for_q
+            ).long()
+            lo_k_tile = key_mse_idx_lo[:, :, s_start:s_end, :].index_select(
+                0, kv_for_q
+            ).long()
+            key_cent_tile = torch.cat(
+                [key_cent_hi[hi_k_tile], key_cent_lo[lo_k_tile]], dim=-1
+            )
+
+            hi_v_tile = val_idx_hi[:, :, s_start:s_end, :].index_select(
+                0, kv_for_q
+            ).long()
+            lo_v_tile = val_idx_lo[:, :, s_start:s_end, :].index_select(
+                0, kv_for_q
+            ).long()
+            val_cent_tile = torch.cat(
+                [val_cent_hi[hi_v_tile], val_cent_lo[lo_v_tile]], dim=-1
+            )
+        else:
+            if key_mse_idx is not None:
+                key_mse_tile = key_mse_idx[:, :, s_start:s_end, :].index_select(
+                    0, kv_for_q
+                )
+                key_cent_tile = key_centroids[key_mse_tile.long()]  # gather
+            else:
+                key_cent_tile = None
+            val_idx_tile = val_idx[:, :, s_start:s_end, :].index_select(
                 0, kv_for_q
             )
-            key_cent_tile = key_centroids[key_mse_tile.long()]  # gather
-        else:
-            key_cent_tile = None
+            val_cent_tile = val_centroids[val_idx_tile.long()]
 
         # ---- logits = norm_k * ( <Q_rot, centroid> + c*gamma * <Q_qjl, signs> )
         # Q_rot: [B, H_q, D]; key_cent_tile: [H_q, B, Sn, D]
@@ -230,8 +327,7 @@ def fused_decompress_attention_ref(
         norms_v_bhs = norms_v_tile.permute(1, 0, 2)
         weights = p * norms_v_bhs
 
-        # val_centroid_tile: [H_q, B, Sn, D] via gather
-        val_cent_tile = val_centroids[val_idx_tile.long()]
+        # val_cent_tile was already built above for both split and single-bucket.
         # contrib = sum_s weights[b,hq,s] * val_cent_tile[hq,b,s,d]
         contrib = torch.einsum("bhs,hbsd->bhd", weights, val_cent_tile)
 

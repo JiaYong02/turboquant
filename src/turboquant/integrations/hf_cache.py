@@ -854,6 +854,10 @@ class TurboQuantCacheLayer(CacheLayerMixin):
         self._Pi_v_per_q: torch.Tensor | None = None
         self._key_cent_lut: torch.Tensor | None = None
         self._val_cent_lut: torch.Tensor | None = None
+        self._key_cent_lut_hi: torch.Tensor | None = None
+        self._key_cent_lut_lo: torch.Tensor | None = None
+        self._val_cent_lut_hi: torch.Tensor | None = None
+        self._val_cent_lut_lo: torch.Tensor | None = None
         self._fused_H_q: int | None = None
 
     def _prepare_fused_state(self, device: torch.device, H_q: int) -> None:
@@ -886,14 +890,34 @@ class TurboQuantCacheLayer(CacheLayerMixin):
             self._Pi_k_per_q = None
 
         # Centroid LUTs are kernel-visible tensors; caching them here lets the
-        # CUDA-graph driver bind a stable pointer at capture time.
-        from ..kernels.decompress_attn import _key_centroid_lut, _val_centroid_lut
-        self._key_cent_lut = (
-            _key_centroid_lut(self._key_quantizer).to(device).contiguous()
+        # CUDA-graph driver bind a stable pointer at capture time. Split-bucket
+        # mode (n_out > 0) uses separate hi/lo LUTs; single-bucket uses one.
+        from ..kernels.decompress_attn import (
+            _key_centroid_lut,
+            _key_centroid_lut_split,
+            _val_centroid_lut,
+            _val_centroid_lut_split,
         )
-        self._val_cent_lut = (
-            _val_centroid_lut(self._value_quantizer).to(device).contiguous()
-        )
+        if self._n_out > 0:
+            kh, kl = _key_centroid_lut_split(self._key_quantizer)
+            vh, vl = _val_centroid_lut_split(self._value_quantizer)
+            self._key_cent_lut_hi = kh.to(device).contiguous()
+            self._key_cent_lut_lo = kl.to(device).contiguous()
+            self._val_cent_lut_hi = vh.to(device).contiguous()
+            self._val_cent_lut_lo = vl.to(device).contiguous()
+            self._key_cent_lut = None
+            self._val_cent_lut = None
+        else:
+            self._key_cent_lut = (
+                _key_centroid_lut(self._key_quantizer).to(device).contiguous()
+            )
+            self._val_cent_lut = (
+                _val_centroid_lut(self._value_quantizer).to(device).contiguous()
+            )
+            self._key_cent_lut_hi = None
+            self._key_cent_lut_lo = None
+            self._val_cent_lut_hi = None
+            self._val_cent_lut_lo = None
 
         self._kv_for_q = kv_for_q
         self._fused_H_q = H_q
@@ -1023,6 +1047,10 @@ class TurboQuantCacheLayer(CacheLayerMixin):
                 kv_for_q=self._kv_for_q,
                 key_cent_lut=self._key_cent_lut,
                 val_cent_lut=self._val_cent_lut,
+                key_cent_lut_hi=self._key_cent_lut_hi,
+                key_cent_lut_lo=self._key_cent_lut_lo,
+                val_cent_lut_hi=self._val_cent_lut_hi,
+                val_cent_lut_lo=self._val_cent_lut_lo,
                 s_total_tensor=s_total_static,
                 scratch=bucket_scratch,
             )
@@ -1153,13 +1181,11 @@ class TurboQuantCacheLayer(CacheLayerMixin):
         # attention hook reads directly from the compressed stores; what we
         # return here is ignored for decode steps. Prefill (S_new > 1) still
         # needs dense K/V because the fused kernel is decode-only. Split-bucket
-        # mode (n_out > 0) is not wired in the fused kernel yet (Phase B-3);
-        # fall back to the dense dequant path until that lands.
+        # mode (n_out > 0) is supported since Phase B-3.
         if (
             self._use_fused_kernel
             and S_new == 1
             and self._seq_length > 1
-            and self._n_out == 0
         ):
             empty = key_states.new_empty(0)
             return empty, empty
@@ -1263,6 +1289,10 @@ class TurboQuantCacheLayer(CacheLayerMixin):
         self._Pi_v_per_q = None
         self._key_cent_lut = None
         self._val_cent_lut = None
+        self._key_cent_lut_hi = None
+        self._key_cent_lut_lo = None
+        self._val_cent_lut_hi = None
+        self._val_cent_lut_lo = None
         self._fused_H_q = None
         self._drop_graph_cache()
         if self.keys is not None:
