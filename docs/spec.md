@@ -35,8 +35,8 @@ in a production-ready llama.cpp fork with native GGML quantization types.
 | 11a | Cached per-Q-head rotations | Done | Eliminate per-call index_select + fp32 cast |
 | 11b | CUDA-graph capture | Done | Slab KV, device-scalar S_total, captured decode |
 | 12 | Rotation fusion (A/B) + fp16 norms (Phase A) | Done | Fused Q/Pi_v rotations, fp16 gamma/norms. Speed DoD parked as future work |
-| 13 | Bit-tight packing | Planned | Byte-crossing packer for odd bit widths (3/5/6); unlocks paper-level compression |
-| 14 | Outlier-channel split | Planned | Fractional avg bit-widths (2.5/3.5) via per-head outlier perm + two buckets |
+| 13 | Bit-tight packing | Done | Byte-crossing packer for odd bit widths (3/5/6); unlocks paper-level compression |
+| 14 | Outlier-channel split | Done | Fractional avg bit-widths (2.5/3.5) via per-head outlier perm + two buckets |
 | 15 | Evaluation suite | Planned | LongBench + perplexity benchmarks |
 | 16 | llama.cpp fork | Planned | Native GGML_TYPE_TQ{b} quantization types |
 | 17+ | Production hardening | Planned | CI/CD, docs, H100/FP8 |
@@ -682,7 +682,23 @@ byte load when `d_off * n_bits % 8 == 0`.
 - `scripts/measure_compression.py --bits 4` emits 134 B/token, 3.82× ratio.
 - Graph perf gate (`TURBOQUANT_CUDA_GRAPH=1`) still ≤ 2.4× SDPA.
 
-## Phase 14: Outlier-Channel Split (planned)
+## Phase 14: Outlier-Channel Split (done)
+
+**Status:** Landed on branch `phase-b-kernel-and-calibration` via the
+B-1 through B-5 commits. Measured compression matches theory exactly
+(tight packing, no slack):
+
+| Mode | `k_avg` | `v_avg` | B/tok/head | Ratio vs FP16 |
+|------|---------|---------|------------|---------------|
+| Single b=4 | 4.00 | 4.00 | 134 | 3.82× |
+| Single b=3 | 3.00 | 3.00 | 102 | 5.02× |
+| Single b=2 | 2.00 | 2.00 |  70 | 7.31× |
+| Split (b=4, f=0.25, hi=5, lo=3) | 3.50 | 3.50 | 118 | **4.34×** |
+| Split (b=3, f=0.25, hi=4, lo=2) | 2.50 | 2.50 |  86 | **5.95×** |
+
+Reproduce with `python scripts/measure_compression.py`.
+
+
 
 ### Goal
 
