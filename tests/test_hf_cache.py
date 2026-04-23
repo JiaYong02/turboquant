@@ -989,3 +989,62 @@ class TestReconstructionQuality:
         assert results[4] > results[3] > results[2], (
             f"Expected b=4 > b=3 > b=2, got {results}"
         )
+
+
+class TestOutlierFracConfig:
+    """TurboQuantCache-level validation for outlier_frac defaults (M2, M3)."""
+
+    def test_rejects_outlier_frac_out_of_range(self, small_config):
+        with pytest.raises(ValueError, match="outlier_frac"):
+            TurboQuantCache(small_config, outlier_frac=1.0)
+
+    def test_default_bucket_widths_reject_low_base_bits(self, small_config):
+        # key_bits=2 → default kbl = 1, violates K-stage min of 2.
+        with pytest.raises(ValueError, match="key_bits_lo"):
+            TurboQuantCache(
+                small_config, key_bits=2, value_bits=4, outlier_frac=0.25
+            )
+
+    def test_default_bucket_widths_reject_high_base_bits(self, small_config):
+        # value_bits=6 → default vbh = 7, exceeds V-stage max of 6.
+        with pytest.raises(ValueError, match="value_bits_hi"):
+            TurboQuantCache(
+                small_config, key_bits=4, value_bits=6, outlier_frac=0.25
+            )
+
+    def test_per_layer_bits_propagate_to_buckets(self, small_config):
+        # per_layer_bits override on one layer should NOT crash even though
+        # outer defaults are valid — the derivation uses each layer's own
+        # base bits.
+        cache = TurboQuantCache(
+            small_config,
+            key_bits=4,
+            value_bits=4,
+            outlier_frac=0.25,
+            per_layer_bits={0: {"key_bits": 3, "value_bits": 3}},
+        )
+        layer0 = cache.layers[0]
+        layer1 = cache.layers[1]
+        # Layer 0: derived from kb=3 → kbh=4, kbl=2
+        assert layer0._key_bits_hi == 4
+        assert layer0._key_bits_lo == 2
+        assert layer0._value_bits_hi == 4
+        assert layer0._value_bits_lo == 2
+        # Layer 1: derived from kb=4 → kbh=5, kbl=3
+        assert layer1._key_bits_hi == 5
+        assert layer1._key_bits_lo == 3
+
+    def test_per_layer_bucket_override(self, small_config):
+        # Explicit per-layer bucket widths take precedence over derived ones.
+        cache = TurboQuantCache(
+            small_config,
+            key_bits=4,
+            value_bits=4,
+            outlier_frac=0.25,
+            per_layer_bits={
+                0: {"key_bits_hi": 5, "key_bits_lo": 2, "value_bits_hi": 5, "value_bits_lo": 2}
+            },
+        )
+        layer0 = cache.layers[0]
+        assert layer0._key_bits_hi == 5
+        assert layer0._key_bits_lo == 2

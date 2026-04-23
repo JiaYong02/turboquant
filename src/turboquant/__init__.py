@@ -17,6 +17,7 @@ __all__ = [
 ]
 
 try:
+    from .calibration import apply_outlier_permutation, calibrate_outliers
     from .codebook_torch import LloydMaxCodebookTorch
     from .qjl_torch import QJLTorch
     from .quantizer_mse_torch import TurboQuantMSETorch
@@ -29,6 +30,8 @@ try:
         "RandomRotationTorch",
         "TurboQuantMSETorch",
         "TurboQuantProdTorch",
+        "apply_outlier_permutation",
+        "calibrate_outliers",
     ]
 except ImportError:
     pass

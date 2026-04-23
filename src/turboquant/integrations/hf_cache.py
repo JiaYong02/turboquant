@@ -6,19 +6,21 @@ compresses keys with TurboQuantProd and values with TurboQuantMSE.
 Storage layout
 --------------
 All heads for a layer are stored together in [H, B, S, ...] tensors.
-Indices are bit-packed so actual storage matches theoretical bit widths:
+Indices are bit-tight packed (see ``bit_packing.py``) so actual storage is
+``ceil(D * n_bits / 8)`` bytes per vector, independent of ``n_bits``:
 
   Keys (TurboQuantProd at b bits):
-    mse_packed : uint8 [H, B, S, ceil(D*(b-1)/8/vpb)]  — (b-1)-bit MSE indices
-    qjl_packed : uint8 [H, B, S, ceil(D/8)]             — 1-bit QJL signs
-    gamma      : f32   [H, B, S]                         — residual norms
-    norms      : f32   [H, B, S]                         — input norms
+    mse_packed : uint8 [H, B, S, ceil(D*(b-1)/8)]  — (b-1)-bit MSE indices
+    qjl_packed : uint8 [H, B, S, ceil(D/8)]        — 1-bit QJL signs
+    gamma      : f16   [H, B, S]                   — residual norms
+    norms      : f16   [H, B, S]                   — input norms
 
   Values (TurboQuantMSE at b bits):
-    idx_packed : uint8 [H, B, S, ceil(D*b/8/vpb)]       — b-bit MSE indices
-    norms      : f32   [H, B, S]                         — input norms
+    idx_packed : uint8 [H, B, S, ceil(D*b/8)]      — b-bit MSE indices
+    norms      : f16   [H, B, S]                   — input norms
 
-where vpb = 8 // b (values per byte for b-bit packing).
+In split-bucket mode (``n_out > 0``), ``mse_packed`` / ``idx_packed`` are
+replaced by ``_hi`` / ``_lo`` pairs sized to the two buckets.
 """
 
 from __future__ import annotations
@@ -75,13 +77,46 @@ class _BatchedKeyStore:
     Sequence dimension (dim=2) grows by concatenation at each decode step.
     """
 
-    def __init__(self, key_bits: int, head_dim: int) -> None:
+    def __init__(
+        self,
+        key_bits: int,
+        head_dim: int,
+        *,
+        n_out: int = 0,
+        bits_hi: int | None = None,
+        bits_lo: int | None = None,
+    ) -> None:
+        if n_out < 0 or n_out > head_dim:
+            raise ValueError(
+                f"n_out must be in [0, head_dim]; got n_out={n_out}, "
+                f"head_dim={head_dim}"
+            )
+        if n_out > 0:
+            if bits_hi is None or bits_lo is None:
+                raise ValueError("bits_hi and bits_lo are required when n_out > 0")
+            # K-stage MSE uses (bits - 1); QJL supplies the final bit, so each
+            # bucket needs at least 2 total bits to leave 1 bit for MSE.
+            if bits_hi < 2 or bits_lo < 2:
+                raise ValueError(
+                    "bits_hi and bits_lo must be >= 2 for the K store "
+                    f"(one bit goes to QJL); got bits_hi={bits_hi}, "
+                    f"bits_lo={bits_lo}"
+                )
+
         self.key_bits = key_bits
         self.head_dim = head_dim
+        self.n_out = n_out
+        self.bits_hi = bits_hi
+        self.bits_lo = bits_lo
         self.qjl_packed: torch.Tensor | None = None   # uint8 [H, B, S, ceil(D/8)]
         self.gamma: torch.Tensor | None = None         # f32   [H, B, S]
         self.norms: torch.Tensor | None = None         # f32   [H, B, S]
+        # Single-bucket mode (n_out == 0).
         self.mse_packed: torch.Tensor | None = None    # uint8 [H, B, S, packed_mse]
+        # Split-bucket mode (n_out > 0). K-stage MSE uses (bits - 1) per bucket
+        # because QJL supplies the final bit.
+        self.mse_packed_hi: torch.Tensor | None = None
+        self.mse_packed_lo: torch.Tensor | None = None
 
         # Slab-mode storage (Phase 11b, CUDA-graph capture). When active, the
         # packed tensors above are fixed-size [H, B, max_seq_len, ...] slabs and
@@ -130,15 +165,28 @@ class _BatchedKeyStore:
         self.norms = torch.empty(
             (H, B, max_seq_len), dtype=torch.float16, device=device
         )
-        mse_bits = self.key_bits - 1
-        if mse_bits > 0:
-            self.mse_packed = torch.empty(
-                (H, B, max_seq_len, packed_dim(D, mse_bits)),
+        if self.n_out > 0:
+            self.mse_packed = None
+            self.mse_packed_hi = torch.empty(
+                (H, B, max_seq_len, packed_dim(self.n_out, self.bits_hi - 1)),
+                dtype=torch.uint8,
+                device=device,
+            )
+            self.mse_packed_lo = torch.empty(
+                (H, B, max_seq_len, packed_dim(D - self.n_out, self.bits_lo - 1)),
                 dtype=torch.uint8,
                 device=device,
             )
         else:
-            self.mse_packed = None
+            mse_bits = self.key_bits - 1
+            if mse_bits > 0:
+                self.mse_packed = torch.empty(
+                    (H, B, max_seq_len, packed_dim(D, mse_bits)),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+            else:
+                self.mse_packed = None
         self._slab_active = True
         self._overflow_warned = False
 
@@ -156,11 +204,17 @@ class _BatchedKeyStore:
         self.norms = self.norms[:, :, :S].contiguous()
         if self.mse_packed is not None:
             self.mse_packed = self.mse_packed[:, :, :S, :].contiguous()
+        if self.mse_packed_hi is not None:
+            self.mse_packed_hi = self.mse_packed_hi[:, :, :S, :].contiguous()
+        if self.mse_packed_lo is not None:
+            self.mse_packed_lo = self.mse_packed_lo[:, :, :S, :].contiguous()
         self._slab_active = False
         self._max_seq_len = None
         self._slab_B = None
 
     def seq_length(self) -> int:
+        # qjl_packed is always populated (QJL stays 1-bit full-D regardless of
+        # split-bucket mode), so it's the canonical seq-length witness.
         if self._slab_active:
             return self._seq_len
         return 0 if self.qjl_packed is None else self.qjl_packed.shape[2]
@@ -203,13 +257,30 @@ class _BatchedKeyStore:
         norms_3d = norms_in.reshape(H, B, S_new).to(torch.float16)
         self.norms = _cat_or_init(self.norms, norms_3d, dim=2)
 
-        # mse indices: [H, B*S_new, D] → pack at (key_bits-1) bits
+        # mse indices: [H, B*S_new, D] → pack at (key_bits-1) bits, or split
+        # into hi/lo buckets when outlier split is active.
         if q_dict["mse"] is not None:
-            mse_bits = self.key_bits - 1
-            mse_4d = q_dict["mse"]["idx"].reshape(H, B, S_new, D)
-            self.mse_packed = _cat_or_init(
-                self.mse_packed, pack_bits(mse_4d, n_bits=mse_bits), dim=2
-            )
+            if self.n_out > 0:
+                idx_hi_4d = q_dict["mse"]["idx_hi"].reshape(H, B, S_new, self.n_out)
+                idx_lo_4d = q_dict["mse"]["idx_lo"].reshape(
+                    H, B, S_new, D - self.n_out
+                )
+                self.mse_packed_hi = _cat_or_init(
+                    self.mse_packed_hi,
+                    pack_bits(idx_hi_4d, n_bits=self.bits_hi - 1),
+                    dim=2,
+                )
+                self.mse_packed_lo = _cat_or_init(
+                    self.mse_packed_lo,
+                    pack_bits(idx_lo_4d, n_bits=self.bits_lo - 1),
+                    dim=2,
+                )
+            else:
+                mse_bits = self.key_bits - 1
+                mse_4d = q_dict["mse"]["idx"].reshape(H, B, S_new, D)
+                self.mse_packed = _cat_or_init(
+                    self.mse_packed, pack_bits(mse_4d, n_bits=mse_bits), dim=2
+                )
 
     def _append_slab(
         self,
@@ -231,10 +302,22 @@ class _BatchedKeyStore:
         norms_3d = norms_in.reshape(H, B, S_new)
         self.norms[:, :, sl].copy_(norms_3d)
 
-        if q_dict["mse"] is not None and self.mse_packed is not None:
-            mse_bits = self.key_bits - 1
-            mse_4d = q_dict["mse"]["idx"].reshape(H, B, S_new, D)
-            self.mse_packed[:, :, sl, :].copy_(pack_bits(mse_4d, n_bits=mse_bits))
+        if q_dict["mse"] is not None:
+            if self.n_out > 0:
+                idx_hi_4d = q_dict["mse"]["idx_hi"].reshape(H, B, S_new, self.n_out)
+                idx_lo_4d = q_dict["mse"]["idx_lo"].reshape(
+                    H, B, S_new, D - self.n_out
+                )
+                self.mse_packed_hi[:, :, sl, :].copy_(
+                    pack_bits(idx_hi_4d, n_bits=self.bits_hi - 1)
+                )
+                self.mse_packed_lo[:, :, sl, :].copy_(
+                    pack_bits(idx_lo_4d, n_bits=self.bits_lo - 1)
+                )
+            elif self.mse_packed is not None:
+                mse_bits = self.key_bits - 1
+                mse_4d = q_dict["mse"]["idx"].reshape(H, B, S_new, D)
+                self.mse_packed[:, :, sl, :].copy_(pack_bits(mse_4d, n_bits=mse_bits))
 
         self._seq_len += S_new
 
@@ -256,8 +339,26 @@ class _BatchedKeyStore:
         gamma = gamma_src.reshape(H, B * S)
         norms = norms_src.reshape(H, B * S)
 
-        mse_q = None
-        if self.mse_packed is not None:
+        mse_q: dict | None = None
+        if self.n_out > 0:
+            hi_src = (
+                self.mse_packed_hi[:, :, :S, :]
+                if self._slab_active
+                else self.mse_packed_hi
+            )
+            lo_src = (
+                self.mse_packed_lo[:, :, :S, :]
+                if self._slab_active
+                else self.mse_packed_lo
+            )
+            idx_hi = unpack_bits(
+                hi_src, n_bits=self.bits_hi - 1, n_values=self.n_out
+            ).reshape(H, B * S, self.n_out)
+            idx_lo = unpack_bits(
+                lo_src, n_bits=self.bits_lo - 1, n_values=D - self.n_out
+            ).reshape(H, B * S, D - self.n_out)
+            mse_q = {"idx_hi": idx_hi, "idx_lo": idx_lo}
+        elif self.mse_packed is not None:
             mse_bits = self.key_bits - 1
             mse_src = (
                 self.mse_packed[:, :, :S, :] if self._slab_active else self.mse_packed
@@ -284,6 +385,9 @@ class _BatchedKeyStore:
         self.norms = self.norms.index_select(1, beam_idx).contiguous()
         if self.mse_packed is not None:
             self.mse_packed = self.mse_packed.index_select(1, beam_idx).contiguous()
+        if self.mse_packed_hi is not None:
+            self.mse_packed_hi = self.mse_packed_hi.index_select(1, beam_idx).contiguous()
+            self.mse_packed_lo = self.mse_packed_lo.index_select(1, beam_idx).contiguous()
         if self._slab_active:
             self._slab_B = int(beam_idx.shape[0])
 
@@ -297,6 +401,9 @@ class _BatchedKeyStore:
             self.norms = self.norms[:, :, :max_length]
         if self.mse_packed is not None:
             self.mse_packed = self.mse_packed[:, :, :max_length, ...]
+        if self.mse_packed_hi is not None:
+            self.mse_packed_hi = self.mse_packed_hi[:, :, :max_length, ...]
+            self.mse_packed_lo = self.mse_packed_lo[:, :, :max_length, ...]
 
     def batch_repeat_interleave(self, repeats: int) -> None:
         if self.qjl_packed is None:
@@ -306,6 +413,9 @@ class _BatchedKeyStore:
         self.norms = self.norms.repeat_interleave(repeats, dim=1)
         if self.mse_packed is not None:
             self.mse_packed = self.mse_packed.repeat_interleave(repeats, dim=1)
+        if self.mse_packed_hi is not None:
+            self.mse_packed_hi = self.mse_packed_hi.repeat_interleave(repeats, dim=1)
+            self.mse_packed_lo = self.mse_packed_lo.repeat_interleave(repeats, dim=1)
         if self._slab_active:
             self._slab_B = int(self.qjl_packed.shape[1])
 
@@ -317,6 +427,9 @@ class _BatchedKeyStore:
         self.norms = self.norms.index_select(1, indices).contiguous()
         if self.mse_packed is not None:
             self.mse_packed = self.mse_packed.index_select(1, indices).contiguous()
+        if self.mse_packed_hi is not None:
+            self.mse_packed_hi = self.mse_packed_hi.index_select(1, indices).contiguous()
+            self.mse_packed_lo = self.mse_packed_lo.index_select(1, indices).contiguous()
         if self._slab_active:
             self._slab_B = int(indices.shape[0])
 
@@ -324,10 +437,40 @@ class _BatchedKeyStore:
 class _BatchedValueStore:
     """Compressed value storage for all H attention heads in a layer."""
 
-    def __init__(self, value_bits: int, head_dim: int) -> None:
+    def __init__(
+        self,
+        value_bits: int,
+        head_dim: int,
+        *,
+        n_out: int = 0,
+        bits_hi: int | None = None,
+        bits_lo: int | None = None,
+    ) -> None:
+        if n_out < 0 or n_out > head_dim:
+            raise ValueError(
+                f"n_out must be in [0, head_dim]; got n_out={n_out}, "
+                f"head_dim={head_dim}"
+            )
+        if n_out > 0:
+            if bits_hi is None or bits_lo is None:
+                raise ValueError("bits_hi and bits_lo are required when n_out > 0")
+            # V stage uses full bit-widths with no QJL stage; require >= 1.
+            if bits_hi < 1 or bits_lo < 1:
+                raise ValueError(
+                    "bits_hi and bits_lo must be >= 1 for the V store; "
+                    f"got bits_hi={bits_hi}, bits_lo={bits_lo}"
+                )
+
         self.value_bits = value_bits
         self.head_dim = head_dim
+        self.n_out = n_out
+        self.bits_hi = bits_hi
+        self.bits_lo = bits_lo
+        # Single-bucket mode (n_out == 0).
         self.idx_packed: torch.Tensor | None = None   # uint8 [H, B, S, packed_D]
+        # Split-bucket mode. V stage uses full bit-widths (no -1).
+        self.idx_packed_hi: torch.Tensor | None = None
+        self.idx_packed_lo: torch.Tensor | None = None
         self.norms: torch.Tensor | None = None         # f32   [H, B, S]
 
         self._max_seq_len: int | None = None
@@ -352,11 +495,24 @@ class _BatchedValueStore:
         self._max_seq_len = max_seq_len
         self._slab_B = B
         self._seq_len = 0
-        self.idx_packed = torch.empty(
-            (H, B, max_seq_len, packed_dim(D, self.value_bits)),
-            dtype=torch.uint8,
-            device=device,
-        )
+        if self.n_out > 0:
+            self.idx_packed = None
+            self.idx_packed_hi = torch.empty(
+                (H, B, max_seq_len, packed_dim(self.n_out, self.bits_hi)),
+                dtype=torch.uint8,
+                device=device,
+            )
+            self.idx_packed_lo = torch.empty(
+                (H, B, max_seq_len, packed_dim(D - self.n_out, self.bits_lo)),
+                dtype=torch.uint8,
+                device=device,
+            )
+        else:
+            self.idx_packed = torch.empty(
+                (H, B, max_seq_len, packed_dim(D, self.value_bits)),
+                dtype=torch.uint8,
+                device=device,
+            )
         self.norms = torch.empty(
             (H, B, max_seq_len), dtype=torch.float16, device=device
         )
@@ -367,7 +523,11 @@ class _BatchedValueStore:
         if not self._slab_active:
             return
         S = self._seq_len
-        self.idx_packed = self.idx_packed[:, :, :S, :].contiguous()
+        if self.idx_packed is not None:
+            self.idx_packed = self.idx_packed[:, :, :S, :].contiguous()
+        if self.idx_packed_hi is not None:
+            self.idx_packed_hi = self.idx_packed_hi[:, :, :S, :].contiguous()
+            self.idx_packed_lo = self.idx_packed_lo[:, :, :S, :].contiguous()
         self.norms = self.norms[:, :, :S].contiguous()
         self._slab_active = False
         self._max_seq_len = None
@@ -376,7 +536,11 @@ class _BatchedValueStore:
     def seq_length(self) -> int:
         if self._slab_active:
             return self._seq_len
-        return 0 if self.idx_packed is None else self.idx_packed.shape[2]
+        if self.idx_packed is not None:
+            return self.idx_packed.shape[2]
+        if self.idx_packed_hi is not None:
+            return self.idx_packed_hi.shape[2]
+        return 0
 
     def append(
         self,
@@ -404,10 +568,24 @@ class _BatchedValueStore:
         H = norms_in.shape[0]
         D = self.head_dim
 
-        idx_4d = q_dict["idx"].reshape(H, B, S_new, D)
-        self.idx_packed = _cat_or_init(
-            self.idx_packed, pack_bits(idx_4d, n_bits=self.value_bits), dim=2
-        )
+        if self.n_out > 0:
+            idx_hi_4d = q_dict["idx_hi"].reshape(H, B, S_new, self.n_out)
+            idx_lo_4d = q_dict["idx_lo"].reshape(H, B, S_new, D - self.n_out)
+            self.idx_packed_hi = _cat_or_init(
+                self.idx_packed_hi,
+                pack_bits(idx_hi_4d, n_bits=self.bits_hi),
+                dim=2,
+            )
+            self.idx_packed_lo = _cat_or_init(
+                self.idx_packed_lo,
+                pack_bits(idx_lo_4d, n_bits=self.bits_lo),
+                dim=2,
+            )
+        else:
+            idx_4d = q_dict["idx"].reshape(H, B, S_new, D)
+            self.idx_packed = _cat_or_init(
+                self.idx_packed, pack_bits(idx_4d, n_bits=self.value_bits), dim=2
+            )
 
         norms_3d = norms_in.reshape(H, B, S_new).to(torch.float16)
         self.norms = _cat_or_init(self.norms, norms_3d, dim=2)
@@ -423,8 +601,18 @@ class _BatchedValueStore:
         D = self.head_dim
         sl = slice(self._seq_len, self._seq_len + S_new)
 
-        idx_4d = q_dict["idx"].reshape(H, B, S_new, D)
-        self.idx_packed[:, :, sl, :].copy_(pack_bits(idx_4d, n_bits=self.value_bits))
+        if self.n_out > 0:
+            idx_hi_4d = q_dict["idx_hi"].reshape(H, B, S_new, self.n_out)
+            idx_lo_4d = q_dict["idx_lo"].reshape(H, B, S_new, D - self.n_out)
+            self.idx_packed_hi[:, :, sl, :].copy_(
+                pack_bits(idx_hi_4d, n_bits=self.bits_hi)
+            )
+            self.idx_packed_lo[:, :, sl, :].copy_(
+                pack_bits(idx_lo_4d, n_bits=self.bits_lo)
+            )
+        else:
+            idx_4d = q_dict["idx"].reshape(H, B, S_new, D)
+            self.idx_packed[:, :, sl, :].copy_(pack_bits(idx_4d, n_bits=self.value_bits))
 
         norms_3d = norms_in.reshape(H, B, S_new)
         self.norms[:, :, sl].copy_(norms_3d)
@@ -432,10 +620,33 @@ class _BatchedValueStore:
         self._seq_len += S_new
 
     def to_quantized_dict(self) -> tuple[dict, torch.Tensor]:
+        D = self.head_dim
+        if self.n_out > 0:
+            H, B = self.idx_packed_hi.shape[:2]
+            S = self._seq_len if self._slab_active else self.idx_packed_hi.shape[2]
+            hi_src = (
+                self.idx_packed_hi[:, :, :S, :]
+                if self._slab_active
+                else self.idx_packed_hi
+            )
+            lo_src = (
+                self.idx_packed_lo[:, :, :S, :]
+                if self._slab_active
+                else self.idx_packed_lo
+            )
+            norms_src = self.norms[:, :, :S] if self._slab_active else self.norms
+
+            idx_hi = unpack_bits(
+                hi_src, n_bits=self.bits_hi, n_values=self.n_out
+            ).reshape(H, B * S, self.n_out)
+            idx_lo = unpack_bits(
+                lo_src, n_bits=self.bits_lo, n_values=D - self.n_out
+            ).reshape(H, B * S, D - self.n_out)
+            norms = norms_src.reshape(H, B * S)
+            return {"idx_hi": idx_hi, "idx_lo": idx_lo}, norms
+
         H, B = self.idx_packed.shape[:2]
         S = self._seq_len if self._slab_active else self.idx_packed.shape[2]
-        D = self.head_dim
-
         idx_src = self.idx_packed[:, :, :S, :] if self._slab_active else self.idx_packed
         norms_src = self.norms[:, :, :S] if self._slab_active else self.norms
 
@@ -446,10 +657,18 @@ class _BatchedValueStore:
 
         return {"idx": idx}, norms
 
+    def _primary_packed(self) -> torch.Tensor | None:
+        return self.idx_packed if self.idx_packed is not None else self.idx_packed_hi
+
     def reorder(self, beam_idx: torch.LongTensor) -> None:
-        if self.idx_packed is None:
+        primary = self._primary_packed()
+        if primary is None:
             return
-        self.idx_packed = self.idx_packed.index_select(1, beam_idx).contiguous()
+        if self.idx_packed is not None:
+            self.idx_packed = self.idx_packed.index_select(1, beam_idx).contiguous()
+        if self.idx_packed_hi is not None:
+            self.idx_packed_hi = self.idx_packed_hi.index_select(1, beam_idx).contiguous()
+            self.idx_packed_lo = self.idx_packed_lo.index_select(1, beam_idx).contiguous()
         self.norms = self.norms.index_select(1, beam_idx).contiguous()
         if self._slab_active:
             self._slab_B = int(beam_idx.shape[0])
@@ -460,20 +679,39 @@ class _BatchedValueStore:
             return
         if self.idx_packed is not None:
             self.idx_packed = self.idx_packed[:, :, :max_length, ...]
+        if self.idx_packed_hi is not None:
+            self.idx_packed_hi = self.idx_packed_hi[:, :, :max_length, ...]
+            self.idx_packed_lo = self.idx_packed_lo[:, :, :max_length, ...]
+        if self.norms is not None:
             self.norms = self.norms[:, :, :max_length]
 
     def batch_repeat_interleave(self, repeats: int) -> None:
-        if self.idx_packed is None:
+        primary = self._primary_packed()
+        if primary is None:
             return
-        self.idx_packed = self.idx_packed.repeat_interleave(repeats, dim=1)
+        if self.idx_packed is not None:
+            self.idx_packed = self.idx_packed.repeat_interleave(repeats, dim=1)
+        if self.idx_packed_hi is not None:
+            self.idx_packed_hi = self.idx_packed_hi.repeat_interleave(repeats, dim=1)
+            self.idx_packed_lo = self.idx_packed_lo.repeat_interleave(repeats, dim=1)
         self.norms = self.norms.repeat_interleave(repeats, dim=1)
         if self._slab_active:
-            self._slab_B = int(self.idx_packed.shape[1])
+            new_B = (
+                self.idx_packed.shape[1]
+                if self.idx_packed is not None
+                else self.idx_packed_hi.shape[1]
+            )
+            self._slab_B = int(new_B)
 
     def batch_select_indices(self, indices: torch.Tensor) -> None:
-        if self.idx_packed is None:
+        primary = self._primary_packed()
+        if primary is None:
             return
-        self.idx_packed = self.idx_packed.index_select(1, indices).contiguous()
+        if self.idx_packed is not None:
+            self.idx_packed = self.idx_packed.index_select(1, indices).contiguous()
+        if self.idx_packed_hi is not None:
+            self.idx_packed_hi = self.idx_packed_hi.index_select(1, indices).contiguous()
+            self.idx_packed_lo = self.idx_packed_lo.index_select(1, indices).contiguous()
         self.norms = self.norms.index_select(1, indices).contiguous()
         if self._slab_active:
             self._slab_B = int(indices.shape[0])
@@ -519,6 +757,12 @@ class TurboQuantCacheLayer(CacheLayerMixin):
         max_seq_len: int | None = None,
         use_cuda_graph: bool = False,
         graph_pool: Any = None,
+        *,
+        n_out: int = 0,
+        key_bits_hi: int | None = None,
+        key_bits_lo: int | None = None,
+        value_bits_hi: int | None = None,
+        value_bits_lo: int | None = None,
     ):
         super().__init__()
         self._layer_idx = layer_idx
@@ -530,6 +774,11 @@ class TurboQuantCacheLayer(CacheLayerMixin):
         self._target_device = device
         self._seq_length = 0
         self._use_fused_kernel = use_fused_kernel
+        self._n_out = n_out
+        self._key_bits_hi = key_bits_hi
+        self._key_bits_lo = key_bits_lo
+        self._value_bits_hi = value_bits_hi
+        self._value_bits_lo = value_bits_lo
 
         # Phase 11b: CUDA-graph capture. Slab preallocation + graph capture
         # require max_seq_len; otherwise we stay on the cat-growth path.
@@ -561,6 +810,9 @@ class TurboQuantCacheLayer(CacheLayerMixin):
             mse_seeds=mse_seeds,
             qjl_seeds=qjl_seeds,
             device=device,
+            n_out=n_out,
+            bits_hi=key_bits_hi,
+            bits_lo=key_bits_lo,
         )
         self._value_quantizer = BatchedTurboQuantMSETorch(
             d=head_dim,
@@ -568,10 +820,25 @@ class TurboQuantCacheLayer(CacheLayerMixin):
             num_heads=num_kv_heads,
             seeds=val_seeds,
             device=device,
+            n_out=n_out,
+            bits_hi=value_bits_hi,
+            bits_lo=value_bits_lo,
         )
 
-        self._key_store = _BatchedKeyStore(key_bits=key_bits, head_dim=head_dim)
-        self._value_store = _BatchedValueStore(value_bits=value_bits, head_dim=head_dim)
+        self._key_store = _BatchedKeyStore(
+            key_bits=key_bits,
+            head_dim=head_dim,
+            n_out=n_out,
+            bits_hi=key_bits_hi,
+            bits_lo=key_bits_lo,
+        )
+        self._value_store = _BatchedValueStore(
+            value_bits=value_bits,
+            head_dim=head_dim,
+            n_out=n_out,
+            bits_hi=value_bits_hi,
+            bits_lo=value_bits_lo,
+        )
 
         # Incremental dense fp32 cache — avoids O(N²) full-dequant each step.
         # Holds [B, H, S_total, D] in fp32; returned as model_dtype at update() exit.
@@ -587,6 +854,10 @@ class TurboQuantCacheLayer(CacheLayerMixin):
         self._Pi_v_per_q: torch.Tensor | None = None
         self._key_cent_lut: torch.Tensor | None = None
         self._val_cent_lut: torch.Tensor | None = None
+        self._key_cent_lut_hi: torch.Tensor | None = None
+        self._key_cent_lut_lo: torch.Tensor | None = None
+        self._val_cent_lut_hi: torch.Tensor | None = None
+        self._val_cent_lut_lo: torch.Tensor | None = None
         self._fused_H_q: int | None = None
 
     def _prepare_fused_state(self, device: torch.device, H_q: int) -> None:
@@ -619,14 +890,34 @@ class TurboQuantCacheLayer(CacheLayerMixin):
             self._Pi_k_per_q = None
 
         # Centroid LUTs are kernel-visible tensors; caching them here lets the
-        # CUDA-graph driver bind a stable pointer at capture time.
-        from ..kernels.decompress_attn import _key_centroid_lut, _val_centroid_lut
-        self._key_cent_lut = (
-            _key_centroid_lut(self._key_quantizer).to(device).contiguous()
+        # CUDA-graph driver bind a stable pointer at capture time. Split-bucket
+        # mode (n_out > 0) uses separate hi/lo LUTs; single-bucket uses one.
+        from ..kernels.decompress_attn import (
+            _key_centroid_lut,
+            _key_centroid_lut_split,
+            _val_centroid_lut,
+            _val_centroid_lut_split,
         )
-        self._val_cent_lut = (
-            _val_centroid_lut(self._value_quantizer).to(device).contiguous()
-        )
+        if self._n_out > 0:
+            kh, kl = _key_centroid_lut_split(self._key_quantizer)
+            vh, vl = _val_centroid_lut_split(self._value_quantizer)
+            self._key_cent_lut_hi = kh.to(device).contiguous()
+            self._key_cent_lut_lo = kl.to(device).contiguous()
+            self._val_cent_lut_hi = vh.to(device).contiguous()
+            self._val_cent_lut_lo = vl.to(device).contiguous()
+            self._key_cent_lut = None
+            self._val_cent_lut = None
+        else:
+            self._key_cent_lut = (
+                _key_centroid_lut(self._key_quantizer).to(device).contiguous()
+            )
+            self._val_cent_lut = (
+                _val_centroid_lut(self._value_quantizer).to(device).contiguous()
+            )
+            self._key_cent_lut_hi = None
+            self._key_cent_lut_lo = None
+            self._val_cent_lut_hi = None
+            self._val_cent_lut_lo = None
 
         self._kv_for_q = kv_for_q
         self._fused_H_q = H_q
@@ -756,6 +1047,10 @@ class TurboQuantCacheLayer(CacheLayerMixin):
                 kv_for_q=self._kv_for_q,
                 key_cent_lut=self._key_cent_lut,
                 val_cent_lut=self._val_cent_lut,
+                key_cent_lut_hi=self._key_cent_lut_hi,
+                key_cent_lut_lo=self._key_cent_lut_lo,
+                val_cent_lut_hi=self._val_cent_lut_hi,
+                val_cent_lut_lo=self._val_cent_lut_lo,
                 s_total_tensor=s_total_static,
                 scratch=bucket_scratch,
             )
@@ -885,8 +1180,13 @@ class TurboQuantCacheLayer(CacheLayerMixin):
         # Fused-kernel fast path: skip dense buffer growth on decode. The custom
         # attention hook reads directly from the compressed stores; what we
         # return here is ignored for decode steps. Prefill (S_new > 1) still
-        # needs dense K/V because the fused kernel is decode-only.
-        if self._use_fused_kernel and S_new == 1 and self._seq_length > 1:
+        # needs dense K/V because the fused kernel is decode-only. Split-bucket
+        # mode (n_out > 0) is supported since Phase B-3.
+        if (
+            self._use_fused_kernel
+            and S_new == 1
+            and self._seq_length > 1
+        ):
             empty = key_states.new_empty(0)
             return empty, empty
 
@@ -966,10 +1266,18 @@ class TurboQuantCacheLayer(CacheLayerMixin):
     def reset(self) -> None:
         self._seq_length = 0
         self._key_store = _BatchedKeyStore(
-            key_bits=self._key_bits, head_dim=self._head_dim
+            key_bits=self._key_bits,
+            head_dim=self._head_dim,
+            n_out=self._n_out,
+            bits_hi=self._key_bits_hi,
+            bits_lo=self._key_bits_lo,
         )
         self._value_store = _BatchedValueStore(
-            value_bits=self._value_bits, head_dim=self._head_dim
+            value_bits=self._value_bits,
+            head_dim=self._head_dim,
+            n_out=self._n_out,
+            bits_hi=self._value_bits_hi,
+            bits_lo=self._value_bits_lo,
         )
         self._slab_preallocated = False
         self._dense_keys = None
@@ -981,6 +1289,10 @@ class TurboQuantCacheLayer(CacheLayerMixin):
         self._Pi_v_per_q = None
         self._key_cent_lut = None
         self._val_cent_lut = None
+        self._key_cent_lut_hi = None
+        self._key_cent_lut_lo = None
+        self._val_cent_lut_hi = None
+        self._val_cent_lut_lo = None
         self._fused_H_q = None
         self._drop_graph_cache()
         if self.keys is not None:
@@ -1042,9 +1354,19 @@ class TurboQuantCache(Cache):
         key_bits: Bits per coordinate for key quantization (default 4).
         value_bits: Bits per coordinate for value quantization (default 4).
         per_layer_bits: Optional per-layer overrides, e.g.
-            {0: {"key_bits": 3, "value_bits": 4}}.
+            ``{0: {"key_bits": 3, "value_bits": 4}}``. When ``outlier_frac > 0``
+            and no explicit bucket widths are provided, each layer's
+            ``key_bits_hi/lo`` defaults to ``(kb + 1, kb - 1)`` derived from
+            the layer's own (possibly overridden) ``key_bits`` — and similarly
+            for values.
         seed: Base random seed for reproducibility.
         device: Target device for quantizer matrices.
+        outlier_frac: Fraction of head-dim channels quantized at higher bits
+            (paper heuristic, Phase B). ``0.0`` disables the split.
+        key_bits_hi/key_bits_lo: Explicit outlier / regular bit widths for
+            keys. If unset, defaults follow the paper formula
+            ``hi = key_bits + 1``, ``lo = key_bits - 1``.
+        value_bits_hi/value_bits_lo: Same for values.
 
     Example::
 
@@ -1067,6 +1389,11 @@ class TurboQuantCache(Cache):
         use_fused_kernel: bool = False,
         max_seq_len: int | None = None,
         use_cuda_graph: bool | None = None,
+        outlier_frac: float = 0.0,
+        key_bits_hi: int | None = None,
+        key_bits_lo: int | None = None,
+        value_bits_hi: int | None = None,
+        value_bits_lo: int | None = None,
     ):
         text_config = config.get_text_config(decoder=True)
         num_layers = text_config.num_hidden_layers
@@ -1093,11 +1420,68 @@ class TurboQuantCache(Cache):
             else None
         )
 
+        # Outlier split (Phase B): n_out channels quantized at higher bits,
+        # remainder at lower bits. Defaults follow the paper formula when
+        # explicit bucket widths aren't supplied (hi = b+1, lo = b-1).
+        if not (0.0 <= outlier_frac < 1.0):
+            raise ValueError(
+                f"outlier_frac must be in [0, 1); got {outlier_frac}"
+            )
+        n_out = int(round(outlier_frac * head_dim)) if outlier_frac > 0 else 0
+
+        def _resolve_bits(
+            stage: str,
+            base_bits: int,
+            hi_override: int | None,
+            lo_override: int | None,
+            min_bits: int,
+        ) -> tuple[int | None, int | None]:
+            """Derive bucket widths from base bits + optional overrides.
+
+            Returns (None, None) when split mode is off. Validates that the
+            resolved widths are within the kernel's supported range.
+            """
+            if n_out == 0:
+                return None, None
+            hi = hi_override if hi_override is not None else base_bits + 1
+            lo = lo_override if lo_override is not None else base_bits - 1
+            # bit_packing supports n_bits in [1, 6]; K stage packs (bits - 1)
+            # so the hi-stage ceiling is 7; V stage packs full bits => 6.
+            max_bits = 7 if stage == "key" else 6
+            if hi < min_bits or hi > max_bits:
+                raise ValueError(
+                    f"{stage}_bits_hi must be in [{min_bits}, {max_bits}]; "
+                    f"got {hi} (base_bits={base_bits}, outlier_frac={outlier_frac})"
+                )
+            if lo < min_bits or lo > max_bits:
+                raise ValueError(
+                    f"{stage}_bits_lo must be in [{min_bits}, {max_bits}]; "
+                    f"got {lo} (base_bits={base_bits}, outlier_frac={outlier_frac})"
+                )
+            return hi, lo
+
         layers = []
         for i in range(num_layers):
             layer_cfg = per_layer_bits.get(i, {})
             kb = layer_cfg.get("key_bits", key_bits)
             vb = layer_cfg.get("value_bits", value_bits)
+            # Per-layer overrides can also specify bucket widths directly;
+            # otherwise derive from this layer's own kb/vb so overrides stay
+            # internally consistent.
+            kbh_i, kbl_i = _resolve_bits(
+                "key",
+                kb,
+                layer_cfg.get("key_bits_hi", key_bits_hi),
+                layer_cfg.get("key_bits_lo", key_bits_lo),
+                min_bits=2,  # K stage: QJL needs 1 bit, MSE needs >= 1
+            )
+            vbh_i, vbl_i = _resolve_bits(
+                "value",
+                vb,
+                layer_cfg.get("value_bits_hi", value_bits_hi),
+                layer_cfg.get("value_bits_lo", value_bits_lo),
+                min_bits=1,  # V stage: MSE only
+            )
             layers.append(
                 TurboQuantCacheLayer(
                     layer_idx=i,
@@ -1111,6 +1495,11 @@ class TurboQuantCache(Cache):
                     max_seq_len=max_seq_len,
                     use_cuda_graph=graph_enabled,
                     graph_pool=graph_pool,
+                    n_out=n_out,
+                    key_bits_hi=kbh_i,
+                    key_bits_lo=kbl_i,
+                    value_bits_hi=vbh_i,
+                    value_bits_lo=vbl_i,
                 )
             )
 
@@ -1124,6 +1513,8 @@ class TurboQuantCache(Cache):
         self._use_fused_kernel = use_fused_kernel
         self._max_seq_len = max_seq_len
         self._use_cuda_graph = graph_enabled
+        self._outlier_frac = outlier_frac
+        self._n_out = n_out
 
     def bind(self):
         """Context manager: route the fused attention hook to this cache."""
